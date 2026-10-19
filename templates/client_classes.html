@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+
+{% set v6 = (version == '6') %}
+{% set list_endpoint = 'main.client_classes.client_classes_version' if v6 else 'main.client_classes.client_classes' %}
+{% set list_kwargs = {'version': '6'} if v6 else {} %}
+{% set new_endpoint = 'main.client_classes.new_client_class_version' if v6 else 'main.client_classes.new_client_class' %}
+{% set new_kwargs = {'version': '6'} if v6 else {} %}
+
+{% block title %}Client Classes ({{ dhcp_label }}) - EZ-KEA{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1><i data-lucide="tags"></i> Client Classes <span style="font-size:.9rem;font-weight:400;color:var(--text-secondary);">{{ dhcp_label }}</span></h1>
+  <div style="display:flex;gap:.5rem;">
+    <a href="{{ url_for(new_endpoint, **new_kwargs) }}" class="btn btn-primary">
+      <i data-lucide="plus-circle"></i> New Class
+    </a>
+  </div>
+</div>
+
+{% set dhcp_version = version|default("4") %}
+{% include 'config_buttons.html' %}
+
+<div class="card">
+  <div class="card-body">
+    <p style="margin:0 0 .5rem 0;color:var(--text-secondary);font-size:.9rem;">
+      A client class is a named condition over the incoming packet. Kea evaluates each
+      class's expression against every request; clients that match get whatever the class
+      carries &mdash; options, lease lifetimes, and (DHCPv4) the fixed BOOTP header fields
+      <code>next-server</code> / <code>boot-file-name</code>.
+    </p>
+    <p style="margin:0;color:var(--text-secondary);font-size:.9rem;">
+      Expressions are written through exactly as typed and judged by Kea's own parser at
+      <strong>Test Config</strong> &mdash; EZ-KEA does not attempt to interpret them, and it cannot tell
+      you which class a real client will match. Kea's expression vocabulary is documented in the
+      <a href="https://kea.readthedocs.io/en/kea-2.6.0/arm/classify.html" target="_blank" rel="noopener">Kea ARM, Client Classification</a>.
+    </p>
+  </div>
+</div>
+
+{% if classes %}
+<div class="card">
+  <div class="card-header">
+    <h2><i data-lucide="list"></i> {{ class_count }} Class{{ '' if class_count == 1 else 'es' }} Configured</h2>
+  </div>
+  <div class="card-body" style="padding:0;">
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:18%;">Name</th>
+            <th>Expression</th>
+            {% if not v6 %}<th style="width:22%;">BOOTP Header Fields</th>{% endif %}
+            <th style="width:9%;">Options</th>
+            <th style="width:12%;text-align:right;">Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for entry in classes %}
+          <tr>
+            <td style="font-weight:600;">{{ entry.name }}</td>
+            <td>
+              {% if entry.test %}
+              <code style="font-size:.8rem;word-break:break-all;">{{ entry.test }}</code>
+              {% else %}
+              <span class="text-secondary">(none &mdash; assigned by name only)</span>
+              {% endif %}
+            </td>
+            {% if not v6 %}
+            <td>
+              {% for key, value in entry.boot.items() %}
+              <div style="font-size:.75rem;">
+                <span class="badge" style="background:rgba(27,161,216,.1);color:var(--primary-blue);">{{ key }}</span>
+                <span style="font-family:monospace;word-break:break-all;">{{ value }}</span>
+              </div>
+              {% else %}
+              <span class="text-secondary" style="font-size:.8rem;">&mdash;</span>
+              {% endfor %}
+            </td>
+            {% endif %}
+            <td>
+              {% if entry.option_count %}
+              <span class="badge badge-success"
+                    title="{{ entry.option_count }} option(s) carried by this class">
+                {{ entry.option_count }} option{{ '' if entry.option_count == 1 else 's' }}
+              </span>
+              {% else %}
+              <span class="text-secondary">0</span>
+              {% endif %}
+            </td>
+            <td style="text-align:right;">
+              <div style="display:flex;gap:.25rem;justify-content:flex-end;">
+                <a href="{{ url_for('main.client_classes.edit_client_class_version', version=version, name=entry.name) }}"
+                   class="btn btn-outline btn-sm" title="Edit class" aria-label="Edit class">
+                  <i data-lucide="pencil"></i>
+                </a>
+                <form action="{{ url_for('main.client_classes.delete_client_class_version', version=version) }}"
+                      method="POST" onsubmit="return confirm('Delete client class {{ entry.name }}?');" style="margin:0;">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <input type="hidden" name="name" value="{{ entry.name }}">
+                  <button type="submit" class="btn btn-danger btn-sm" title="Delete class" aria-label="Delete class">
+                    <i data-lucide="trash"></i>
+                  </button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% else %}
+<div class="card">
+  <div class="card-body" style="text-align:center;padding:3rem 1rem;">
+    <i data-lucide="tags" style="width:48px;height:48px;color:var(--text-secondary);opacity:.5;margin-bottom:1rem;"></i>
+    <h2>No Client Classes Configured</h2>
+    <p style="color:var(--text-secondary);margin-bottom:1.5rem;">
+      Nothing in this configuration classifies clients. Every client is served the global,
+      shared-network and subnet settings as-is.
+    </p>
+    <a href="{{ url_for(new_endpoint, **new_kwargs) }}" class="btn btn-primary">
+      <i data-lucide="plus-circle"></i> Create the first class
+    </a>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

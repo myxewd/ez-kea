@@ -24,6 +24,16 @@ os.environ.setdefault("LOG_INDEX_ENABLED", "0")
 # Same reasoning, for the lease/reservation search index (core/state_index.py).
 os.environ.setdefault("STATE_INDEX_ENABLED", "0")
 
+# The suite must not behave differently depending on whether a Kea binary
+# happens to be installed on the machine running it. Save paths run the daemon's
+# own `-t` against the candidate config (core/config_validate.py), and a local
+# Kea 2.x rejects the `control-sockets` list spelling that most fixtures here
+# write by hand -- while a machine without Kea skips the check entirely. Pin the
+# command to a path that cannot exist (a test that wants the check to run
+# supplies its own validator or its own command).
+os.environ["KEA_DHCP4_CMD"] = "/nonexistent/kea-dhcp4-not-installed"
+os.environ["KEA_DHCP6_CMD"] = "/nonexistent/kea-dhcp6-not-installed"
+
 from werkzeug.security import generate_password_hash  # noqa: E402
 
 TEST_PASSWORD_HASH = generate_password_hash("test-password-not-used-1234567")

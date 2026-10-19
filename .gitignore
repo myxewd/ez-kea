@@ -73,3 +73,6 @@ testbed/data/etc/kea/kea-dhcp4.conf
 
 # Local agent context — machine-specific notes, not part of the product
 CLAUDE.md
+
+# Local verification harness (scratch: boot a throwaway EZ-KEA + real Kea in WSL)
+local-verify/

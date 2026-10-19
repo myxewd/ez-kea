@@ -1,12 +1,18 @@
 # SPDX-FileCopyrightText: 2026 Kaleb Fenley
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
+import json
 from typing import Any, Dict, Optional, Union, Tuple
 from flask_login import login_required
 from flask import Blueprint, render_template, request, redirect, url_for, current_app, flash
 from werkzeug.wrappers import Response
 from ..core.config_manager import load_json, save_kea_config, with_config_lock
-from ..core.validation import classify_network_address, validate_mac_address, validate_ip_range, validate_ipv4_address, has_overlap, return_available_ips, get_active_leases, sanitize_hostname
+from ..core.validation import (
+    classify_network_address, validate_mac_address, validate_ip_range, validate_ipv4_address,
+    has_overlap, return_available_ips, get_active_leases, sanitize_hostname,
+    V4_BOOT_FIELDS, parse_scope_params, apply_scope_params, update_option_data,
+    validate_option_data, _parse_option_rows,
+)
 from ..core import state_index
 from ..core.csv_export import stream_csv_response
 
@@ -150,8 +156,13 @@ def new_subnet() -> Union[str, Response, Tuple[str, int]]:
         routers = request.form.get("routers")
         static_only = request.form.get("static-only") == "on"
         shared_network_name = request.form.get("shared-network-name", "").strip()
-        
+
         config = load_json(current_app.config["DHCP_CONFIG_FILE"])
+
+        # Kea's fixed BOOTP-header parameters (see V4_BOOT_FIELDS) are ordinary
+        # scope keys, not options, so they can't ride through option-data.
+        scope_params, scope_errors = parse_scope_params(request.form, V4_BOOT_FIELDS)
+        errors.extend(scope_errors)
 
         if not subnet:
             errors.append("Subnet is required.")
@@ -180,14 +191,18 @@ def new_subnet() -> Union[str, Response, Tuple[str, int]]:
                 errors.append("Invalid IP range. Please ensure the range is within the subnet and start_ip < end_ip.")
 
         if errors:
-            return render_template("new_subnet.html", shared_network_name=shared_network_name, errors=errors), 400
+            return render_template(
+                "new_subnet.html", shared_network_name=shared_network_name, errors=errors,
+                scope_params=scope_params,
+            ), 400
 
         new_subnet_obj = {
             "id": _next_subnet_id(config),
             "subnet": subnet,
-            "option-data": [{"name": "routers", "data": routers}] if routers else [],
             "reservations": []
         }
+        update_option_data(new_subnet_obj, {"routers": routers} if routers else {}, managed=["routers"])
+        apply_scope_params(new_subnet_obj, scope_params, V4_BOOT_FIELDS)
         if not static_only:
             new_subnet_obj["pools"] = [{"pool": f"{range_start} - {range_end}"}]
 
@@ -266,6 +281,7 @@ def edit_subnet() -> Union[str, Response, Tuple[str, int]]:
             "new_subnet.html", shared_network_name=shared_network_name or "", errors=errors,
             editing=True, subnet=subnet, current_router=current_router,
             static_only=static_only, range_start=range_start, range_end=range_end,
+            scope_params={name: subnet_obj.get(name, "") for name in V4_BOOT_FIELDS},
         )
 
     # POST
@@ -277,6 +293,9 @@ def edit_subnet() -> Union[str, Response, Tuple[str, int]]:
     subnet_obj, _ = _find_subnet4(config, subnet)
     if subnet_obj is None:
         errors.append(f"Subnet '{subnet}' was not found in the configuration.")
+
+    scope_params, scope_errors = parse_scope_params(request.form, V4_BOOT_FIELDS)
+    errors.extend(scope_errors)
 
     if not routers:
         errors.append("Router Address is required.")
@@ -299,9 +318,14 @@ def edit_subnet() -> Union[str, Response, Tuple[str, int]]:
             "new_subnet.html", shared_network_name=shared_network_name, errors=errors,
             editing=True, subnet=subnet, current_router=routers,
             static_only=static_only, range_start=range_start or "", range_end=range_end or "",
+            scope_params=scope_params,
         ), 400
 
-    subnet_obj["option-data"] = [{"name": "routers", "data": routers}] if routers else []
+    # Merge rather than rebuild: the subnet's option-data may hold options this
+    # form knows nothing about (per-scope custom options, vendor suboptions),
+    # and replacing the list outright deleted them on any gateway edit.
+    update_option_data(subnet_obj, {"routers": routers} if routers else {}, managed=["routers"])
+    apply_scope_params(subnet_obj, scope_params, V4_BOOT_FIELDS)
     if static_only:
         subnet_obj.pop("pools", None)
     else:
@@ -333,6 +357,66 @@ def _find_reservation4(config: Dict[str, Any], hw_address: str, subnet: str) -> 
         if reservation.get("hw-address") == hw_address:
             return subnet_obj, reservation
     return subnet_obj, None
+
+# Per-host DHCP options (Kea's reservation-level "option-data"). Same
+# name/data pair shape the global and class editors use, so a reservation can
+# carry any option Kea knows about -- including one defined with option-def --
+# without EZ-KEA needing to understand it.
+_MAX_RESERVATION_OPTION_ROWS = 50
+
+
+def _parse_reservation_options(form: Any) -> Tuple[Dict[str, str], list, list]:
+    """The reservation form's option rows (see validation._parse_option_rows)."""
+    return _parse_option_rows(form, "res-option", _MAX_RESERVATION_OPTION_ROWS)
+
+
+def _submitted_option_rows(form: Any) -> list:
+    """Every option row to re-render: the live ones as (name, data), and any
+    the operator marked for removal as (name, None) so the removal is not lost
+    when the rest of the form fails validation."""
+    rows: list = []
+    for index in range(_MAX_RESERVATION_OPTION_ROWS):
+        name = (form.get(f"res-option-name-{index}") or "").strip()
+        data = (form.get(f"res-option-data-{index}") or "").strip()
+        if form.get(f"res-option-deleted-{index}"):
+            if name:
+                # data None = the row is marked removed; True = it exists on
+                # disk, so the form keeps showing it struck through.
+                rows.append((name, None, True))
+            continue
+        if name or data:
+            # A row being re-rendered after a failed save may or may not exist
+            # on disk; a non-empty name means it was on the form already, so
+            # treat it as saved and let the ✓/✕ rules stay consistent.
+            rows.append((name, data, True))
+    return rows
+
+
+# Blank rows a fresh form starts with, so an option can be typed straight in
+# without clicking "Add Option" first. Blank rows are ignored on save.
+_RESERVATION_BLANK_OPTION_ROWS = 2
+
+
+def _reservation_option_rows(reservation: Optional[Dict[str, Any]]) -> list:
+    """
+    Rows for the reservation's option table, as (name, data, saved).
+
+    `saved` tells the form (and its JavaScript) whether the row corresponds to
+    something already in the Kea config: a saved row's ✕ strikes it through and
+    records it for removal, while a row the user just added -- or a blank row
+    the form seeded so it is usable -- has its ✕ simply drop the row, because
+    there is nothing on disk to remove.
+    """
+    entries = (reservation or {}).get("option-data")
+    rows = [
+        (e.get("name", ""), e.get("data", ""), True)
+        for e in entries
+        if isinstance(e, dict)
+    ] if isinstance(entries, list) else []
+    if not rows:
+        rows = [("", "", False)] * _RESERVATION_BLANK_OPTION_ROWS
+    return rows
+
 
 def _mac_reservation_sort_key(reservation: Dict[str, Any]) -> Tuple[int, Any]:
     """Sort key for reservation listing. Valid IPv4 addresses sort
@@ -373,6 +457,21 @@ def mac_reservations() -> str:
     finally:
         conn.close()
 
+    # The index stores the per-host metadata as JSON text (see
+    # core/state_index.py). Decode it here rather than in the template: Jinja's
+    # from_json filter only exists on Flask >= 2.1, and the project supports
+    # older ones.
+    for row in result["rows"]:
+        for key in ("boot_config", "classes"):
+            raw = row.get(key)
+            if isinstance(raw, str) and raw:
+                try:
+                    row[key] = json.loads(raw)
+                except ValueError:
+                    row[key] = None
+            else:
+                row[key] = row.get(key) or ({} if key == "boot_config" else [])
+
     return render_template(
         "mac_reservations.html",
         mac_reservations=result["rows"],
@@ -403,12 +502,28 @@ def mac_reservations_export() -> Response:
         finally:
             conn.close()
 
+    def _describe_boot(row):
+        """Rendered for the export the same way the list shows it: the boot
+        fields this host overrides, as key=value pairs."""
+        raw = row.get("boot_config")
+        if not raw:
+            return ""
+        try:
+            boot = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            return str(raw)
+        return "; ".join(f"{k}={v}" for k, v in boot.items()) if isinstance(boot, dict) else str(boot)
+
     return stream_csv_response(
-        ["mac_address", "ip_address", "hostname", "subnet", "shared_network_name"],
+        ["mac_address", "ip_address", "hostname", "subnet", "shared_network_name",
+         "options_count", "boot_config", "classes"],
         rows(),
         lambda row: [
             row["mac_address"] or "", row["ip_address"] or "", row["hostname"] or "",
             row["subnet"] or "", row["shared_network_name"] or "",
+            row.get("options_count") or 0,
+            _describe_boot(row),
+            ", ".join(json.loads(row["classes"])) if row.get("classes") else "",
         ],
         "ez-kea-reservations4",
         state_index.EXPORT_MAX_ROWS,
@@ -428,6 +543,15 @@ def new_reservation() -> Union[str, Response, Tuple[str, int]]:
         ip_address = request.form.get("ip-address")
         hostname_raw = request.form.get("hostname")
         mac_address = request.form.get("mac-address")
+
+        # Per-host fixed-header parameters. Kea permits all three on a
+        # reservation, so a single machine can be pointed at a different boot
+        # server or boot file without its own subnet.
+        scope_params, scope_errors = parse_scope_params(request.form, V4_BOOT_FIELDS)
+        errors.extend(scope_errors)
+
+        reservation_options, option_rows, option_errors = _parse_reservation_options(request.form)
+        errors.extend(option_errors)
 
         if not subnet: errors.append("Subnet is required.")
         if not ip_address: errors.append("IP address is required.")
@@ -449,13 +573,21 @@ def new_reservation() -> Union[str, Response, Tuple[str, int]]:
                 errors.append(f"Subnet '{subnet}' was not found in the configuration.")
 
         if errors:
-            return render_template("new_reservation.html", subnet_data=subnet_data, errors=errors), 400
+            return render_template(
+                "new_reservation.html", subnet_data=subnet_data, errors=errors,
+                scope_params=scope_params, option_rows=_submitted_option_rows(request.form),
+            ), 400
 
-        subnet_obj.setdefault("reservations", []).append({
+        # (kept: the submitted rows are re-rendered so a rejected save loses
+        # nothing -- see _submitted_option_rows)
+        reservation = {
             "hostname": hostname,
             "hw-address": mac_address,
             "ip-address": ip_address
-        })
+        }
+        apply_scope_params(reservation, scope_params, V4_BOOT_FIELDS)
+        update_option_data(reservation, reservation_options, row_order=option_rows)
+        subnet_obj.setdefault("reservations", []).append(reservation)
 
         save_kea_config(config, current_app.config["DHCP_CONFIG_FILE"], current_app.config["BACKUP_DIR"])
         # Unlike logs/leases, EZ-KEA itself just wrote this reservation --
@@ -464,7 +596,8 @@ def new_reservation() -> Union[str, Response, Tuple[str, int]]:
         state_index.reindex_now(current_app, kinds=["reservation4"])
         return redirect(url_for("main.dhcp4.mac_reservations"))
 
-    return render_template("new_reservation.html", subnet_data=subnet_data, errors=errors)
+    return render_template("new_reservation.html", subnet_data=subnet_data, errors=errors,
+                           option_rows=[("", "", False)] * _RESERVATION_BLANK_OPTION_ROWS)
 
 @dhcp4_bp.route("/delete-reservation", methods=["POST"])
 @login_required
@@ -527,6 +660,8 @@ def edit_reservation() -> Union[str, Response, Tuple[str, int]]:
         return render_template(
             "new_reservation.html", subnet_data=subnet_data, errors=errors,
             editing=True, subnet=subnet, reservation=reservation,
+            scope_params={name: reservation.get(name, "") for name in V4_BOOT_FIELDS},
+            option_rows=_reservation_option_rows(reservation),
         )
 
     # POST
@@ -545,6 +680,12 @@ def edit_reservation() -> Union[str, Response, Tuple[str, int]]:
 
     if not mac_address: errors.append("MAC is required.")
     elif not validate_mac_address(mac_address): errors.append("Invalid MAC Address format.")
+
+    scope_params, scope_errors = parse_scope_params(request.form, V4_BOOT_FIELDS)
+    errors.extend(scope_errors)
+
+    reservation_options, option_rows, option_errors = _parse_reservation_options(request.form)
+    errors.extend(option_errors)
 
     subnet_obj, reservation = None, None
     if subnet:
@@ -565,6 +706,7 @@ def edit_reservation() -> Union[str, Response, Tuple[str, int]]:
         return render_template(
             "new_reservation.html", subnet_data=subnet_data, errors=errors,
             editing=True, subnet=subnet, reservation=fallback_reservation,
+            scope_params=scope_params, option_rows=_submitted_option_rows(request.form),
         ), 400
 
     reservation.update({
@@ -572,8 +714,13 @@ def edit_reservation() -> Union[str, Response, Tuple[str, int]]:
         "hw-address": mac_address,
         "ip-address": ip_address,
     })
+    apply_scope_params(reservation, scope_params, V4_BOOT_FIELDS)
+    # Unmanaged options survive: only the names submitted through the form are
+    # touched, and only the rows the operator explicitly deleted are dropped.
+    update_option_data(reservation, reservation_options, row_order=option_rows)
 
     save_kea_config(config, current_app.config["DHCP_CONFIG_FILE"], current_app.config["BACKUP_DIR"])
+    state_index.reindex_now(current_app, kinds=["reservation4"])
     return redirect(url_for("main.dhcp4.mac_reservations"))
 
 @dhcp4_bp.route("/leases")

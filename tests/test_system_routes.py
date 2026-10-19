@@ -32,8 +32,19 @@ def app(tmp_path):
     app.register_blueprint(system_bp)
     db.init_app(app)
     login_manager.init_app(app)
+
+    # Register a loader on this test's own app. The real one lives on the
+    # module-level login_manager in ez_kea/auth.py, so without this the module
+    # only works when something else has already imported auth in the same
+    # process -- running this file alone failed every @login_required route
+    # with "Missing user_loader".
+    from ez_kea.models import User
+
+    @login_manager.user_loader
+    def _load_user(user_id):
+        return db.session.get(User, int(user_id))
+
     with app.app_context():
-        from ez_kea.models import User  # noqa: F401
         db.create_all()
     yield app
 
@@ -152,15 +163,11 @@ def test_syntax_check_success(mock_subprocess_run, client):
 @patch('subprocess.run')
 def test_syntax_check_failure(mock_subprocess_run, client):
     """Test /test-config endpoint when Kea syntax check fails."""
-    import subprocess
-    # Setup mock to raise a CalledProcessError (simulating a non-zero exit code)
-    mock_error = subprocess.CalledProcessError(
-        returncode=1,
-        cmd=["kea-dhcp4", "-t", "/dummy/path/kea-dhcp4.conf"],
-        output="Some stdout info",
-        stderr="Syntax check failed: Parse error at line 10"
-    )
-    mock_subprocess_run.side_effect = mock_error
+    # A failed check is a non-zero exit whose output carries Kea's complaint
+    # (see core/config_validate.py -- the exit code is read, not `check=True`).
+    mock_subprocess_run.return_value.returncode = 1
+    mock_subprocess_run.return_value.stdout = "Some stdout info"
+    mock_subprocess_run.return_value.stderr = "Syntax check failed: Parse error at line 10"
     
     response = client.post("/test-config")
     
@@ -189,14 +196,9 @@ def test_apply_config_success(mock_subprocess_run, client):
 @patch('subprocess.run')
 def test_apply_config_syntax_failure(mock_subprocess_run, client):
     """Test /apply-config endpoint fails and aborts if syntax check fails."""
-    import subprocess
-    mock_error = subprocess.CalledProcessError(
-        returncode=1,
-        cmd=["kea-dhcp4", "-t", "/dummy/path/kea-dhcp4.conf"],
-        output="",
-        stderr="Syntax check failed!"
-    )
-    mock_subprocess_run.side_effect = mock_error
+    mock_subprocess_run.return_value.returncode = 1
+    mock_subprocess_run.return_value.stdout = ""
+    mock_subprocess_run.return_value.stderr = "Syntax check failed!"
     
     response = client.post("/apply-config")
     
@@ -526,6 +528,8 @@ def test_syntax_check_rejects_arbitrary_binary(mock_subprocess_run, app, client)
 def test_apply_config_rejects_arbitrary_ctrl_binary(mock_subprocess_run, app, client):
     """Same PoC, but via KEA_CTRL_CMD on the reload step."""
     app.config["KEA_CTRL_CMD"] = "/tmp/evil.sh"
+    # The syntax step must pass for this to reach the reload guard.
+    mock_subprocess_run.return_value.returncode = 0
 
     response = client.post("/apply-config")
 
@@ -634,6 +638,7 @@ def full_app(tmp_path):
     """
     from flask import Blueprint
     from ez_kea import db, login_manager
+    import ez_kea.auth  # noqa: F401  -- registers login_manager.user_loader
 
     app = Flask(__name__)
     app.config["TESTING"] = True
@@ -647,7 +652,10 @@ def full_app(tmp_path):
     app.config["DHCP_LOG_FILE"] = str(tmp_path / "kea-dhcp4.log")
     app.config["BACKUP_DIR"] = str(tmp_path / "backups")
     app.config["SETTINGS_FILE"] = str(tmp_path / "ez-kea-settings.json")
-    app.config["KEA_DHCP4_CMD"] = "kea-dhcp4"
+    # A command that cannot exist: these tests are about what the form writes,
+    # not about the pre-save syntax gate (which would otherwise make the result
+    # depend on whichever Kea version happens to be installed on this machine).
+    app.config["KEA_DHCP4_CMD"] = "/nonexistent/kea-dhcp4-not-installed"
     app.config["KEA_CTRL_CMD"] = "keactrl"
     main_bp = Blueprint('main', __name__)
     main_bp.register_blueprint(system_bp)
@@ -695,13 +703,15 @@ def test_save_app_settings_does_not_duplicate_logger_output_options(full_app, fu
     Regression test: saving global settings (here, just the reload strategy --
     nothing subnet-related) against the skeleton's own default "kea-dhcp4"
     logger must not leave it with both a pre-existing key and a second,
-    differently-spelled key for the same setting. Kea's own parser treats
-    "output_options" and "output-options" as the same parameter and refuses
-    to load a config with both present in one logger -- see
-    AUDIT_FINDINGS.md, 2026-08-02, where this broke a real config's syntax
-    check after a settings save. An empty file forces load_json() to fall
-    back to the skeleton, which already carries the "kea-dhcp4" logger this
-    save path has to match by name.
+    differently-spelled key for the same setting. An empty file forces
+    load_json() to fall back to the skeleton, which already carries the
+    "kea-dhcp4" logger this save path has to match by name.
+
+    The spelling asserted here is Kea's own: "output_options" is the key
+    "kea-dhcp4 -t" accepts, and "output-options" is rejected outright with
+    "got unexpected keyword" -- verified against a real Kea 2.0.2 (see
+    tests/test_scope_config.py, which covers the same fact for the skeleton).
+    A config carrying both spellings fails to load either way.
     """
     open(full_app.config["DHCP_CONFIG_FILE"], "w").close()
 
@@ -712,8 +722,8 @@ def test_save_app_settings_does_not_duplicate_logger_output_options(full_app, fu
         written = json.load(f)
     loggers = written["Dhcp4"]["loggers"]
     assert len(loggers) == 1
-    assert "output-options" in loggers[0]
-    assert "output_options" not in loggers[0]
+    assert "output_options" in loggers[0]
+    assert "output-options" not in loggers[0]
 
 def test_save_app_settings_rejects_new_malicious_log_file(full_client):
     """An out-of-tree log path must be rejected via the save-settings form field."""

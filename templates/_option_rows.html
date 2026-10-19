@@ -1,0 +1,129 @@
+{#
+  One option row, shared by the three option tables (global settings, client
+  classes, per-reservation).
+
+  A row is one of two things, and the ✕ means something different for each:
+
+    * class option-row-saved -- the option already exists in the Kea config.
+      The ✕ strikes the row through and records it for removal; saving the
+      form deletes it. Clicking the same ✕ again puts the row back, so a
+      mistaken removal is undoable right up until the save.
+    * no such class -- a row the user just added in this edit. Nothing exists
+      server-side yet, so the ✕ simply drops the row.
+
+  The class is what the JavaScript dispatches on (see the script at the bottom
+  of this file). The hidden field is never visible: the ✕ drives it. A removed
+  row's fields are readonly rather than disabled, so their values stay in the
+  submission and a save that fails validation can re-render the row.
+#}
+{% import "_icons.html" as icons %}
+{% macro option_row(prefix, index, name, data, saved, deleted=False, name_placeholder='e.g. root-path', data_placeholder='value') %}
+<tr class="option-row{% if saved %} option-row-saved{% endif %}{% if deleted %} option-row-removed{% endif %}">
+  <td style="text-align:center;">
+    <input type="hidden" name="{{ prefix }}-deleted-{{ index }}"
+           value="{{ name if deleted else '' }}">
+    <button type="button" class="btn btn-danger btn-sm"
+            title="{{ 'Keep this option (undo the removal)' if deleted else 'Remove this option' }}"
+            aria-label="{{ 'Keep this option (undo the removal)' if deleted else 'Remove this option' }}"
+            onclick="removeOptionRow(this, '{{ prefix }}')">
+      {% if deleted %}{{ icons.icon_undo(18) }}{% else %}{{ icons.icon_x(18) }}{% endif %}
+    </button>
+  </td>
+  <td><input type="text" class="form-control" name="{{ prefix }}-name-{{ index }}"
+             value="{{ name }}" placeholder="{{ name_placeholder }}"
+             style="font-family:ui-monospace,monospace;"
+             oninput="syncRemovedName(this)"{% if deleted %} readonly{% endif %}></td>
+  <td><input type="text" class="form-control" name="{{ prefix }}-data-{{ index }}"
+             value="{{ data }}" placeholder="{{ data_placeholder }}"{% if deleted %} readonly{% endif %}></td>
+</tr>
+{% endmacro %}
+
+<script>
+/* Shared by the three option tables. A row is one of two things:
+     saved -- the option is already in the Kea config, so the ✕ strikes it
+              through and records it for removal; saving deletes it.
+     added -- nothing exists server-side yet, so the ✕ just drops the row.
+   The hidden field names the option to delete; for a saved row it is kept in
+   step with the name field, so renaming and then removing still deletes the
+   option that is actually on disk. */
+function optionRowIsSaved(row) {
+  return row.classList.contains('option-row-saved');
+}
+
+function removeOptionRow(button, prefix) {
+  const row = button.closest('tr');
+  if (!optionRowIsSaved(row)) {
+    // Nothing exists server-side yet: the ✕ just drops the row.
+    row.remove();
+    return;
+  }
+  const nameInput = row.querySelector('input[name^="' + prefix + '-name-"]');
+  const dataInput = row.querySelector('input[name^="' + prefix + '-data-"]');
+  const deleted = row.querySelector('input[name^="' + prefix + '-deleted-"]');
+
+  if (row.classList.contains('option-row-removed')) {
+    // Second click on the same ✕: put it back. The row becomes an ordinary
+    // saved option again, so saving keeps it instead of deleting it. The
+    // fields are readonly (not disabled) while removed, so their values were
+    // never dropped from the submission.
+    row.classList.remove('option-row-removed');
+    if (deleted) { deleted.value = ''; }
+    if (nameInput) { nameInput.readOnly = false; }
+    if (dataInput) { dataInput.readOnly = false; }
+    paintRemoveButton(row, false);
+    return;
+  }
+
+  if (deleted) { deleted.value = nameInput ? nameInput.value : ''; }
+  row.classList.add('option-row-removed');
+  if (nameInput) { nameInput.readOnly = true; }
+  if (dataInput) { dataInput.readOnly = true; }
+  paintRemoveButton(row, true);
+}
+
+/* Swap in the other inline SVG. The markup is emitted rather than re-run
+   through lucide (see _icons.html), so there is no timing to get wrong. */
+const ICON_X = '{{ icons.icon_x(18) | replace("\n", " ") | safe }}';
+const ICON_UNDO = '{{ icons.icon_undo(18) | replace("\n", " ") | safe }}';
+function paintRemoveButton(row, removed) {
+  const button = row.querySelector('button');
+  if (!button) { return; }
+  const label = removed ? 'Keep this option (undo the removal)' : 'Remove this option';
+  button.title = label;
+  button.setAttribute('aria-label', label);
+  button.innerHTML = removed ? ICON_UNDO : ICON_X;
+}
+
+function syncRemovedName(input) {
+  const row = input.closest('tr');
+  if (!row || !optionRowIsSaved(row)) { return; }
+  const prefix = input.name.replace(/-name-\d+$/, '');
+  const deleted = row.querySelector('input[name^="' + prefix + '-deleted-"]');
+  if (deleted) { deleted.value = input.value; }
+}
+
+function addOptionRow(tableId, prefix) {
+  const table = document.getElementById(tableId);
+  const body = table.tBodies[0];
+  const template = body.querySelector('tr.option-template');
+  const row = template.cloneNode(true);
+  row.classList.remove('option-template');
+  row.style.display = '';
+  let index = 0;
+  while (table.querySelector('[name="' + prefix + '-name-' + index + '"]')) { index += 1; }
+  row.querySelectorAll('input').forEach(function (input) {
+    input.name = input.name.replace('__INDEX__', index).replace('__PREFIX__', prefix);
+    input.value = '';
+    input.readOnly = false;
+    input.disabled = false;
+  });
+  paintRemoveButton(row, false);
+  body.insertBefore(row, template);
+  const first = row.querySelector('input[type="text"]');
+  if (first) { first.focus(); }
+}
+</script>
+<style>
+  tr.option-row-removed { opacity: .45; }
+  tr.option-row-removed input[type="text"] { text-decoration: line-through; }
+</style>

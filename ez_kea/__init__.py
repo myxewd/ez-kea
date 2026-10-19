@@ -130,6 +130,16 @@ def create_app(config_class: Any = Config, config_overrides: dict | None = None)
     # which is precisely what a fresh install against a packaged Kea hits,
     # since those ship /etc/kea 0750 _kea:_kea.
     from .core.config_manager import BackupError, ConfigAccessError
+    from .core.config_validate import InvalidConfigError
+
+    @app.errorhandler(InvalidConfigError)
+    def _handle_invalid_config_error(e: InvalidConfigError):
+        """A route that does not catch this itself still gets a page naming the
+        reason, instead of a bare 500."""
+        from flask import jsonify as _jsonify, render_template, request as _request
+        if _request.path.startswith(("/apply-changes", "/test-config", "/backup-config", "/restore-config")):
+            return _jsonify({"error": str(e)}), 400
+        return render_template("error.html", message=str(e)), 400
 
     @app.errorhandler(ConfigAccessError)
     def _handle_config_access_error(e: ConfigAccessError):

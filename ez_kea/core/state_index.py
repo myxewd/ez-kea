@@ -45,6 +45,7 @@ the very page they just used, up to STATE_INDEX_INTERVAL seconds later.
 """
 import csv
 import ipaddress
+import json
 import os
 import sqlite3
 import threading
@@ -53,6 +54,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .log_index import classify_term, normalize_mac, normalize_mac_prefix
+from .validation import V4_BOOT_FIELDS
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 500
@@ -177,7 +179,12 @@ CREATE TABLE IF NOT EXISTS state_reservation4 (
     ip_address           TEXT,
     hostname             TEXT,
     subnet               TEXT,
-    shared_network_name  TEXT
+    shared_network_name  TEXT,
+    -- per-host metadata, so the list can show that a host carries something
+    -- beyond address/hostname (see _reservation_flags)
+    options_count        INTEGER,
+    boot_config          TEXT,
+    classes              TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_res4_subnet ON state_reservation4(subnet);
 
@@ -237,10 +244,20 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     actually added, not on every connect().
     """
     migrated = False
-    for table in ("state_lease4", "state_lease6"):
+    # Every column added after a table shipped, as (table, column, type). The
+    # index is disposable, so "does the column exist yet" is the whole
+    # migration story -- no version table.
+    added_columns = (
+        ("state_lease4", "subnet", "TEXT"),
+        ("state_lease6", "subnet", "TEXT"),
+        ("state_reservation4", "options_count", "INTEGER"),
+        ("state_reservation4", "boot_config", "TEXT"),
+        ("state_reservation4", "classes", "TEXT"),
+    )
+    for table, column, column_type in added_columns:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-        if "subnet" not in columns:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN subnet TEXT")
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
             migrated = True
     if migrated:
         # idx_lease4_subnet/idx_lease6_subnet pre-existed pointing at
@@ -412,6 +429,31 @@ def parse_lease6(path: str, subnet_map: Optional[Dict[int, str]] = None) -> List
     return list(by_address.values())
 
 
+def _reservation_flags(reservation: Dict[str, Any]) -> Dict[str, Any]:
+    """Per-host metadata for the reservation list: whether the host carries
+    options, a boot source, or class assignments beyond its address.
+
+    Computed here (not in the route) so the fingerprint-gated ingest always
+    refreshes it when the config changes, which is what makes the badges
+    trustworthy without a separate query per page render.
+    """
+    if not isinstance(reservation, dict):
+        return {"options_count": 0, "boot_config": None, "classes": None}
+
+    options = reservation.get("option-data")
+    options_count = len([o for o in options if isinstance(o, dict)]) if isinstance(options, list) else 0
+
+    boot_props = {name: reservation[name] for name in V4_BOOT_FIELDS if reservation.get(name)}
+    classes = reservation.get("client-classes")
+    classes = [str(c) for c in classes] if isinstance(classes, list) else []
+
+    return {
+        "options_count": options_count,
+        "boot_config": json.dumps(boot_props) if boot_props else None,
+        "classes": json.dumps(classes) if classes else None,
+    }
+
+
 def parse_reservation4(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Every MAC reservation in the config, standalone and shared-network
     subnets alike -- the same walk mac_reservations() does in routes/dhcp4.py."""
@@ -425,6 +467,7 @@ def parse_reservation4(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "hostname": reservation.get("hostname"),
                 "subnet": subnet.get("subnet"),
                 "shared_network_name": None,
+                **_reservation_flags(reservation),
             })
     for network in dhcp4.get("shared-networks", []):
         name = network.get("name")
@@ -436,6 +479,7 @@ def parse_reservation4(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "hostname": reservation.get("hostname"),
                     "subnet": subnet.get("subnet"),
                     "shared_network_name": name,
+                    **_reservation_flags(reservation),
                 })
     return rows
 
@@ -862,7 +906,8 @@ def search_reservation4(conn: sqlite3.Connection, *, q: Optional[str] = None, ma
     sort_column = _RES4_SORT_COLUMNS.get(sort, "ip_address")
     return _run_search(
         conn, "state_reservation4",
-        ("mac_address", "ip_address", "hostname", "subnet", "shared_network_name"),
+        ("mac_address", "ip_address", "hostname", "subnet", "shared_network_name",
+         "options_count", "boot_config", "classes"),
         joins, where, params, sort_column, direction, limit, offset,
     )
 

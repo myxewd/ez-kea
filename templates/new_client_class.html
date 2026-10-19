@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% import "_option_rows.html" as row_macro %}
+{% import "_icons.html" as icons %}
+
+{% set v6 = (version == '6') %}
+{% set save_endpoint = 'main.client_classes.save_client_class_version' if v6 else 'main.client_classes.save_client_class' %}
+{% set save_kwargs = {'version': '6'} if v6 else {} %}
+{% set list_endpoint = 'main.client_classes.client_classes_version' if v6 else 'main.client_classes.client_classes' %}
+{% set list_kwargs = {'version': '6'} if v6 else {} %}
+
+{% block title %}{{ 'Edit Client Class' if editing else 'New Client Class' }} - EZ-KEA{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1><i data-lucide="{{ 'pencil' if editing else 'plus-circle' }}"></i>
+    {{ 'Edit Client Class' if editing else 'New Client Class' }}
+    <span style="font-size:.9rem;font-weight:400;color:var(--text-secondary);">{{ dhcp_label }}</span>
+  </h1>
+  <a href="{{ url_for(list_endpoint, **list_kwargs) }}" class="btn btn-outline">
+    <i data-lucide="arrow-left"></i> Back to Client Classes
+  </a>
+</div>
+
+<div class="card" style="max-width:900px;margin:0 auto;">
+  <div class="card-header">
+    <h2>Class Definition</h2>
+  </div>
+  <div class="card-body">
+    {% if errors %}
+    <div class="alert alert-danger">
+      <ul style="margin:0;padding-left:1.5rem;">
+        {% for error in errors %}<li>{{ error }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    <form action="{{ url_for(save_endpoint, **save_kwargs) }}" method="POST">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      {% if editing %}<input type="hidden" name="original-name" value="{{ original_name }}">{% endif %}
+
+      <div class="form-group">
+        <label for="class-name" class="form-label">Class Name <span style="color:var(--danger-red);">*</span></label>
+        <input type="text" class="form-control" id="class-name" name="class-name"
+               value="{{ class_entry.get('name', '') }}" placeholder="e.g. uefi-x64" required>
+        <p class="text-secondary" style="font-size:.8rem;margin-top:.25rem;">
+          Kea identifies a class by its name, so renaming one is a rename of the class itself.
+        </p>
+      </div>
+
+      <div class="form-group">
+        <label for="class-test" class="form-label">Expression <span style="color:var(--danger-red);">*</span></label>
+        <textarea class="form-control" id="class-test" name="class-test" rows="3" spellcheck="false"
+                  style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85rem;"
+                  placeholder="e.g. option[93].hex == 0x0007">{{ class_entry.get('test', '') }}</textarea>
+        <p class="text-secondary" style="font-size:.8rem;margin-top:.25rem;">
+          Written into the config verbatim and parsed by Kea &mdash; a typo is reported by
+          <strong>Test Config</strong> / <strong>Apply Changes</strong>, not here. A few checks that
+          were verified against real client packets:
+          <code>substring(option[77].hex, 0, 4) == 'iPXE'</code> (the iPXE user class &mdash; matches
+          the booted iPXE, not the firmware that loaded it),
+          <code>option[93].hex == 0x0007</code> (client architecture: 7 is x86-64 UEFI, 0 is BIOS),
+          <code>substring(option[60].hex, 0, 9) == 'PXEClient'</code> (any PXE client).
+          <br>
+          Two things worth knowing: <code>option[N].hex</code> is the option payload as bytes, so
+          <code>substring</code> offsets and lengths count bytes and a quoted string is compared
+          byte for byte. And a loaded iPXE announces itself in option 77, <em>not</em> option 60
+          &mdash; both the firmware and iPXE send a <code>PXEClient:Arch:...:UNDI:...</code> vendor
+          class, so option 60 cannot tell the two stages apart.
+        </p>
+      </div>
+
+      {% if not v6 %}
+      <hr style="border-color:var(--card-border);margin:1.5rem 0;">
+      <h3 style="font-size:1rem;color:var(--text-secondary);margin-bottom:.5rem;">
+        <i data-lucide="server-cog" style="width:16px;height:16px;"></i> BOOTP Header Fields
+        <span style="font-weight:400;font-size:.8rem;">(optional)</span>
+      </h3>
+      {# sname is legal but read by no PXE/iPXE client: carried through, not offered. #}
+      <input type="hidden" name="server-hostname" value="{{ boot_values.get('server-hostname', '') }}">
+      <div class="row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1.5rem;">
+        <div class="form-group">
+          <label for="next-server" class="form-label">Next Server <span style="color:var(--text-secondary);font-size:.75rem;">siaddr, IPv4</span></label>
+          <input type="text" class="form-control" id="next-server" name="next-server"
+                 value="{{ boot_values.get('next-server', '') }}" placeholder="e.g. 192.168.1.10">
+        </div>
+        <div class="form-group">
+          <label for="boot-file-name" class="form-label">Boot File Name <span style="color:var(--text-secondary);font-size:.75rem;">file</span></label>
+          <input type="text" class="form-control" id="boot-file-name" name="boot-file-name"
+                 value="{{ boot_values.get('boot-file-name', '') }}" placeholder="e.g. a filename or URL">
+        </div>
+      </div>
+      {% endif %}
+
+      <hr style="border-color:var(--card-border);margin:1.5rem 0;">
+
+      <h3 style="font-size:1rem;color:var(--text-secondary);margin-bottom:.5rem;">
+        <i data-lucide="sliders-horizontal" style="width:16px;height:16px;"></i> Options for Matching Clients
+        <span style="font-weight:400;font-size:.8rem;">(optional)</span>
+      </h3>
+      <p style="color:var(--text-secondary);font-size:.85rem;margin-bottom:1rem;">
+        Any option Kea accepts here, by name &mdash; including options defined with
+        <code>option-def</code>. Existing rows are shown so they are preserved. Use the
+        ✕ to remove one, and Add Option to get another row.
+      </p>
+      <div class="table-container" style="margin-bottom:.5rem;">
+        <table id="class-option-table">
+          <thead>
+            <tr>
+              <th style="width:3rem;text-align:center;" title="Remove this option">&nbsp;</th>
+              <th style="width:35%;">Option Name</th>
+              <th>Option Data</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% set rows = option_rows if option_rows else [] %}
+            {% for name, data, saved in rows %}
+            {{ row_macro.option_row('class-option', loop.index0, name,
+                                    data if data is not none else '',
+                                    saved=saved, deleted=(data is none),
+                                    data_placeholder='value sent to matching clients') }}
+            {% endfor %}
+            <tr class="option-template" style="display:none;">
+              <td style="text-align:center;">
+                <input type="hidden" name="__PREFIX__-deleted-__INDEX__" value="">
+                <button type="button" class="btn btn-danger btn-sm"
+                        onclick="removeOptionRow(this, '__PREFIX__')">
+                  {{ icons.icon_x(18) }}
+                </button>
+              </td>
+              <td><input type="text" class="form-control" name="__PREFIX__-name-__INDEX__"
+                         placeholder="e.g. root-path" style="font-family:ui-monospace,monospace;"
+                         oninput="syncRemovedName(this)"></td>
+              <td><input type="text" class="form-control" name="__PREFIX__-data-__INDEX__"
+                         placeholder="value sent to matching clients"></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <button type="button" class="btn btn-outline btn-sm"
+              onclick="addOptionRow('class-option-table','class-option')">
+        <i data-lucide="plus"></i> Add Option
+      </button>
+
+
+      <div style="display:flex;justify-content:flex-end;">
+        <button type="submit" class="btn btn-primary">
+          <i data-lucide="check"></i> {{ 'Save Changes' if editing else 'Create Class' }}
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+{% include '_option_rows.html' %}

@@ -94,6 +94,25 @@
 
       <hr style="border-color: var(--card-border); margin: 2rem 0;">
 
+      <h3 style="font-size:1rem;color:var(--text-secondary);margin-bottom:.5rem;">
+        <i data-lucide="server-cog" style="width:16px;height:16px;"></i> Boot Parameters <span style="font-weight:400;font-size:.8rem;">(optional)</span>
+      </h3>
+      {# sname is legal but read by no PXE/iPXE client: carried through, not offered. #}
+      <input type="hidden" name="server-hostname" value="{{ scope_params.get('server-hostname', '') if scope_params else '' }}">
+      <div class="row" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1.5rem;">
+        <div class="form-group">
+          <label for="next-server" class="form-label">Next Server <span style="color:var(--text-secondary);font-size:.75rem;">siaddr, IPv4</span></label>
+          <input type="text" class="form-control" id="next-server" name="next-server"
+            value="{{ scope_params.get('next-server', '') if scope_params else '' }}" placeholder="e.g. 192.168.1.10">
+        </div>
+        <div class="form-group">
+          <label for="boot-file-name" class="form-label">Boot File Name <span style="color:var(--text-secondary);font-size:.75rem;">file</span></label>
+          <input type="text" class="form-control" id="boot-file-name" name="boot-file-name"
+            value="{{ scope_params.get('boot-file-name', '') if scope_params else '' }}" placeholder="e.g. pxelinux.0, an iPXE script or a URL">
+        </div>
+      </div>
+
+      <hr style="border-color: var(--card-border); margin: 2rem 0;">
       <div style="display: flex; justify-content: flex-end;">
         <button type="submit" class="btn btn-primary">
           <i data-lucide="check"></i> {{ 'Save Changes' if editing else 'Create Subnet' }}

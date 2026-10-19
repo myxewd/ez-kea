@@ -221,6 +221,17 @@ a:hover {
   border-radius: 5px;
 }
 
+/* Icon sizing, stated once instead of inherited from lucide's attributes.
+   Without this a button is only as tall as its icon's box, so anything that
+   produced an empty or unsized icon collapsed the whole control -- which is
+   exactly what happened to the option tables' cloned template row. */
+.btn svg {
+  width: 1.05em;
+  height: 1.05em;
+  flex: none;
+  display: block;
+}
+
 /* Utility: keeps a <form> from breaking layout flow when it wraps a
    single inline action (e.g. a delete button next to a link). */
 .d-inline {

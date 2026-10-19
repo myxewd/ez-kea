@@ -77,6 +77,8 @@
                         <a href="{{ url_for('main.dhcp4.pools') }}" class="navbar-dropdown-item"><i data-lucide="folder-tree"></i> Pools</a>
                         <a href="{{ url_for('main.dhcp4.mac_reservations') }}" class="navbar-dropdown-item"><i data-lucide="hard-drive"></i> Reservations</a>
                         <a href="{{ url_for('main.dhcp4.leases') }}" class="navbar-dropdown-item"><i data-lucide="list"></i> Leases</a>
+                        <a href="{{ url_for('main.client_classes.client_classes') }}" class="navbar-dropdown-item"><i data-lucide="tags"></i> Client Classes</a>
+                        <a href="{{ url_for('main.system.advanced_config') }}" class="navbar-dropdown-item"><i data-lucide="file-json"></i> Advanced Config</a>
                     </div>
                 </li>
 
@@ -89,6 +91,8 @@
                         <a href="{{ url_for('main.dhcp6.pools6') }}" class="navbar-dropdown-item"><i data-lucide="folder-tree"></i> Pools</a>
                         <a href="{{ url_for('main.dhcp6.reservations6') }}" class="navbar-dropdown-item"><i data-lucide="hard-drive"></i> Reservations</a>
                         <a href="{{ url_for('main.dhcp6.leases6') }}" class="navbar-dropdown-item"><i data-lucide="list"></i> Leases</a>
+                        <a href="{{ url_for('main.client_classes.client_classes_version', version='6') }}" class="navbar-dropdown-item"><i data-lucide="tags"></i> Client Classes</a>
+                        <a href="{{ url_for('main.system.advanced_config_version', version='6') }}" class="navbar-dropdown-item"><i data-lucide="file-json"></i> Advanced Config</a>
                     </div>
                 </li>
 

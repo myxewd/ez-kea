@@ -81,11 +81,15 @@ q={{ search_query | urlencode }}&subnet={{ subnet | urlencode }}&sort={{ (sort o
             <th>{{ sort_link('hostname', 'Hostname') }}</th>
             <th>Shared Network</th>
             <th>{{ sort_link('subnet', 'Subnet') }}</th>
+            <th>Per-Host</th>
             <th style="text-align: right;">Action</th>
           </tr>
         </thead>
         <tbody>
           {% for reservation in mac_reservations %}
+          {# boot_config / classes arrive already decoded from the route. #}
+          {% set hboot = reservation.boot_config or {} %}
+          {% set hclasses = reservation.classes or [] %}
           <tr>
             <td style="font-family: monospace; font-size: 1.1em; color: var(--primary-blue);">{{
               reservation.ip_address or 'N/A' }}</td>
@@ -105,6 +109,28 @@ q={{ search_query | urlencode }}&subnet={{ subnet | urlencode }}&sort={{ (sort o
               {% endif %}
             </td>
             <td><span class="badge" style="background-color: rgba(255, 255, 255, 0.1);">{{ reservation.subnet }}</span>
+            </td>
+            <td>
+              {% for key, value in hboot.items() %}
+              <div style="font-size:.72rem;margin-bottom:.15rem;"
+                   title="{{ key }} = {{ value }}">
+                <span class="badge" style="background:rgba(27,161,216,.12);color:var(--primary-blue);">{{ key }}</span>
+                <span style="font-family:monospace;word-break:break-all;">{{ value }}</span>
+              </div>
+              {% endfor %}
+              {% for cls in hclasses %}
+              <span class="badge" style="background:rgba(139,92,246,.15);color:#a78bfa;"
+                    title="Reserved into client class">{{ cls }}</span>
+              {% endfor %}
+              {% if reservation.options_count %}
+              <span class="badge badge-success"
+                    title="{{ reservation.options_count }} option(s) set on this reservation only">
+                {{ reservation.options_count }} option{{ '' if reservation.options_count == 1 else 's' }}
+              </span>
+              {% endif %}
+              {% if not hboot and not hclasses and not reservation.options_count %}
+              <span class="text-secondary" style="font-size:.8rem;">&mdash;</span>
+              {% endif %}
             </td>
             <td style="text-align: right;">
               <a href="{{ url_for('main.dhcp4.edit_reservation', **{'hw-address': reservation.mac_address or '', 'subnet': reservation.subnet}) }}"

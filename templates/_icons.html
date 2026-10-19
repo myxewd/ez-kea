@@ -1,0 +1,24 @@
+{#
+  Inline SVG icons, emitted server-side.
+
+  Lucide's createIcons() swaps every <i data-lucide="..."> for an <svg> when
+  the page loads. That is fine for markup that is visible at the time, but a
+  row that is display:none and gets *cloned* later -- the option tables' hidden
+  template row -- can end up copied as a bare <i>, which has no box of its own
+  and collapses the button around it. Emitting the SVG directly removes the
+  dependency on that timing entirely. Geometry matches lucide (24x24 viewBox,
+  stroke currentColor, width/height 2).
+
+  Path data is lucide's own (ISC licence, vendored in static/vendor/lucide/).
+#}
+{% macro icon_x(size=18) %}
+<svg xmlns="http://www.w3.org/2000/svg" width="{{ size }}" height="{{ size }}" viewBox="0 0 24 24"
+     fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+     aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+{% endmacro %}
+
+{% macro icon_undo(size=18) %}
+<svg xmlns="http://www.w3.org/2000/svg" width="{{ size }}" height="{{ size }}" viewBox="0 0 24 24"
+     fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+     aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+{% endmacro %}

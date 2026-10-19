@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+
+{% set v6 = (version == '6') %}
+{% set save_endpoint = 'main.system.save_advanced_config_version' if v6 else 'main.system.save_advanced_config' %}
+{% set save_endpoint_kwargs = {'version': '6'} if v6 else {} %}
+
+{% block title %}Advanced Configuration - EZ-KEA{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1><i data-lucide="braces"></i> Advanced Configuration</h1>
+</div>
+
+{% set dhcp_version = version|default("4") %}
+{% include 'config_buttons.html' %}
+
+{% if errors %}
+<div class="alert alert-danger">
+  <ul style="margin: 0; padding-left: 1.5rem;">
+    {% for error in errors %}
+    <li>{{ error }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-header">
+    <h2><i data-lucide="file-json"></i> {{ root_key }} Configuration Document</h2>
+  </div>
+  <div class="card-body">
+    <div class="alert" style="background: rgba(245,158,11,.08); border: 1px solid rgba(245,158,11,.25);">
+      <p style="margin: 0 0 .5rem 0;"><strong>This is the whole Kea configuration file, not just the part the forms cover.</strong></p>
+      <ul style="margin: 0; padding-left: 1.25rem; color: var(--text-secondary); font-size: .9rem;">
+        <li>Use this for anything the structured pages do not expose &mdash; <code>client-classes</code>,
+            <code>option-def</code>, <code>option-space</code>, hooks, vendor-specific scope parameters.</li>
+        <li>Kea's own <code>//</code>, <code>#</code> and <code>/* */</code> comments are accepted.</li>
+        <li>The document must be a JSON object with a <code>{{ root_key }}</code> key.</li>
+        <li>The previous file is backed up first, and the result is handed to Kea's syntax checker.
+            A rejected document is reported here &mdash; it is <em>not</em> rolled back automatically,
+            so keep a backup you can restore if it will not load.</li>
+        <li>Saving writes the file; the running daemon reloads on <strong>Apply Changes</strong>.</li>
+      </ul>
+    </div>
+
+    <p style="color: var(--text-secondary); font-size: .85rem;">
+      Editing <code>{{ config_file }}</code>
+    </p>
+
+    <form action="{{ url_for(save_endpoint, **save_endpoint_kwargs) }}" method="POST" id="advanced-config-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="form-group">
+        <textarea class="form-control" id="config-json" name="config-json" spellcheck="false"
+          rows="32" style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; white-space: pre; overflow-wrap: normal; overflow-x: auto;">{{ config_text }}</textarea>
+      </div>
+      <p id="json-status" style="font-size: .875rem; min-height: 1.25rem;"></p>
+      <div style="display: flex; justify-content: flex-end;">
+        <button type="submit" class="btn btn-primary">
+          <i data-lucide="save"></i> Save Configuration
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+  (function () {
+    var form = document.getElementById('advanced-config-form');
+    var textarea = document.getElementById('config-json');
+    var status = document.getElementById('json-status');
+    var rootKey = {{ root_key | tojson }};
+
+    form.addEventListener('submit', function (event) {
+      try {
+        var parsed = JSON.parse(textarea.value);
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed) || !(rootKey in parsed)) {
+          event.preventDefault();
+          status.innerHTML = '<span style="color: var(--danger-red);">Document must be a JSON object containing a "' + rootKey + '" key.</span>';
+        }
+      } catch (e) {
+        // Not fatal: the server strips Kea's //, # and /* */ comments before
+        // parsing, which JSON.parse cannot do, so a document that is valid for
+        // Kea may well fail here. Defer to the server rather than block it.
+        status.innerHTML = '<span style="color: var(--text-secondary);">Note: this is not strict JSON (Kea comments are allowed) &mdash; the server will validate it.</span>';
+      }
+    });
+  })();
+</script>
+{% endblock %}

@@ -27,8 +27,40 @@ from ..core.security import validate_kea_command, validate_log_file_path, Invali
 from ..core.kea_ctrl import send_command, find_unix_socket_path, ControlChannelError
 from ..core import state_index
 from ..core.ha_manager import get_ha_params
+from ..core.validation import (
+    boot_fields_for, parse_scope_params, apply_scope_params, update_option_data,
+    validate_option_data, _parse_option_rows,
+)
+from ..core.config_validate import test_config_file
 
 system_bp = Blueprint('system', __name__)
+
+# DHCP options this page renders as first-class form fields rather than as
+# free-form rows. Everything else in the scope's option-data is presented in
+# the generic "additional options" table and round-tripped verbatim, so no
+# option is unreachable just because it isn't in this list.
+_MANAGED_V4_OPTIONS = ("domain-name-servers", "ntp-servers", "domain-name")
+_MANAGED_V6_OPTIONS = ("dns-servers", "sntp-servers", "domain-search")
+# Upper bound on free-form option rows accepted from one submission. The form
+# renders one row per configured option plus a few blank ones, so this is far
+# above any realistic config and exists only to bound a hand-crafted POST.
+_MAX_EXTRA_OPTION_ROWS = 100
+# Blank rows the global-settings form always renders, so an operator can add a
+# new option without JavaScript.
+_EXTRA_OPTION_BLANK_ROWS = 3
+
+
+def _boot_fields(version: str) -> tuple:
+    """The Kea fixed-header scope parameters valid for the given DHCP version.
+    DHCPv6 has no BOOTP header, so its tuple is empty."""
+    return boot_fields_for("Dhcp6" if version == "6" else "Dhcp4")
+
+
+def _reject_json_constant(token: str):
+    """json.loads(parse_constant=...) hook: Kea's parser has no NaN/Infinity,
+    but Python's json module accepts both by default. Refusing them here keeps
+    a document that Kea would reject from being written as if it were fine."""
+    raise ValueError(f"unsupported literal '{token}'")
 
 # Global timers are Kea uint32 fields — reject non-positive and absurdly
 # large values instead of letting an invalid value reach the Kea config.
@@ -406,24 +438,27 @@ def restore_config(version: str = "4") -> Union[Response, Tuple[Response, int]]:
              return jsonify({"error": str(e)}), 500
 
 def _test_config_impl(version: str) -> Union[Response, Tuple[Response, int]]:
-    """Test the syntactic validity of the Kea configuration file for `version`."""
+    """
+    Test the syntactic validity of the Kea configuration file for `version`.
+
+    Shares its implementation with the pre-save check (see
+    core/config_validate.py) so the button and the save path can never disagree
+    about what Kea accepts.
+    """
     daemon = _resolve_daemon_config(version)
-    try:
-        command = validate_kea_command(current_app.config[daemon["cmd_key"]], f"kea-dhcp{version}-cmd")
-    except InvalidKeaCommandError as e:
-        return jsonify({"error": str(e)}), 400
-    command = command + ["-t", _in_container_config_path(daemon)]
-    try:
-        subprocess.run(command, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError as e:
-        error_msg = f"{e.stdout}\n{e.stderr}".strip()
-        if "Syntax check failed" in error_msg or "error" in error_msg.lower():
-            return jsonify({"error": f"Syntax error in configuration file: {error_msg}"}), 500
-        else:
-            return jsonify({"error": error_msg}), 500
-    except FileNotFoundError as e:
-        return jsonify({"error": f"Could not run Kea syntax check — binary not found: {e}"}), 500
-    return jsonify({"message": "Syntax check passed!"})
+    result = test_config_file(daemon["config_file"], dict(current_app.config),
+                              dhcp_key=daemon["dhcp_root_key"])
+    if result.ok:
+        return jsonify({"message": "Syntax check passed!"})
+    if not result.ran:
+        # The check itself could not run: the operator's command configuration
+        # is refused (their input -> 400) or the environment cannot run it
+        # (missing binary, timeout -> 500).
+        return jsonify({"error": result.output}), (400 if result.invalid_command else 500)
+    detail = result.output
+    if "Syntax check failed" in detail or "error" in detail.lower():
+        detail = f"Syntax error in configuration file: {detail}"
+    return jsonify({"error": detail}), 500
 
 @system_bp.route("/test-config", methods=["POST"])
 @login_required
@@ -777,6 +812,38 @@ def logs_reindex() -> Response:
     flash("Log index cleared — rebuilding from the log files now.", "success")
     return redirect(url_for("main.system.logs"))
 
+def _parse_extra_option_rows() -> Tuple[List[str], Dict[str, str], set]:
+    """
+    Read the free-form "additional options" rows off the global-settings form.
+
+    Each row is submitted as opt-extra-name-<i> / opt-extra-data-<i>, and a row
+    the operator removed carries opt-extra-deleted-<i>. Returns
+    (errors, {name: data}, {removed names}); rows with a blank name are
+    ignored, a name without data is an error (Kea rejects empty option data),
+    and a repeated name is an error rather than one silently winning over the
+    other.
+
+    Removals are named explicitly because "absent from this submission" cannot
+    mean "delete": the table only renders options it already knows about.
+    """
+    options, row_order, errors = _parse_option_rows(
+        request.form, "opt-extra", _MAX_EXTRA_OPTION_ROWS)
+    return errors, options, row_order
+
+
+def _managed_option_rows(prefix: str, presets: Dict[str, str]) -> list:
+    """
+    The global page's fixed preset fields (DNS, NTP, ...) as rows for the
+    positional merge, placed before the free-form table (negative indices sort
+    first). Without these the merge would treat "the form never showed this
+    preset" as true and drop a preset the operator just filled in.
+    """
+    return [
+        (-len(presets) + position, name, name not in presets)
+        for position, name in enumerate(_MANAGED_V6_OPTIONS if prefix == "6" else _MANAGED_V4_OPTIONS)
+    ]
+
+
 def _build_dhcp_settings_context(version: str = "4") -> Dict[str, Any]:
     """Build the template context shared by the DHCP-settings GET view and
     the error-path re-render of the same page after a failed POST."""
@@ -788,10 +855,30 @@ def _build_dhcp_settings_context(version: str = "4") -> Dict[str, Any]:
     filtered_settings = {k: v for k, v in dhcp.items() if k != "shared-networks"}
     global_options = {opt["name"]: opt["data"] for opt in dhcp.get("option-data", [])}
 
+    managed = _MANAGED_V6_OPTIONS if version == "6" else _MANAGED_V4_OPTIONS
+    # Every option the preset fields don't own, as ordered (name, data) pairs.
+    # Rendering these as editable rows is what makes the table lossless: an
+    # option that appears here is re-submitted unchanged unless the operator
+    # actually edits or deletes it.
+    extra_options = [
+        (opt.get("name", ""), opt.get("data", ""), True)
+        for opt in dhcp.get("option-data", [])
+        if isinstance(opt, dict) and opt.get("name") not in managed
+    ]
+    if not extra_options:
+        # A fresh form starts usable without clicking "Add Option"; these are
+        # not saved rows, so the ✕ just removes them (see the row macro).
+        extra_options = [("", "", False)] * _EXTRA_OPTION_BLANK_ROWS
+
     return {
         "version": version,
         "global_settings": filtered_settings,
         "global_options": global_options,
+        "extra_options": extra_options,
+        "boot_values": {
+            name: dhcp.get(name, "")
+            for name in _boot_fields(version)
+        },
     }
 
 def _build_app_settings_context(version: str = "4") -> Dict[str, Any]:
@@ -877,6 +964,15 @@ def _save_dhcp_settings_impl(version: str) -> Union[Response, Tuple[str, int]]:
             continue
         parsed_timers[timer] = value
 
+    # Fixed BOOTP-header parameters (DHCPv4 only — see core/validation.py) and
+    # the free-form option rows are validated alongside the timers so a bad
+    # submission never half-writes the config.
+    boot_fields = _boot_fields(version)
+    scope_params, scope_errors = parse_scope_params(request.form, boot_fields)
+    timer_errors.extend(scope_errors)
+    extra_errors, extra_options, option_rows = _parse_extra_option_rows()
+    timer_errors.extend(extra_errors)
+
     if timer_errors:
         return render_template("global_settings.html", errors=timer_errors, **_build_dhcp_settings_context(version)), 400
 
@@ -925,27 +1021,33 @@ def _save_dhcp_settings_impl(version: str) -> Union[Response, Tuple[str, int]]:
             if identifier:
                 server_id["identifier"] = identifier
 
-    # Global option-data: v4 gets DNS/NTP/domain-name, v6 gets its own
-    # namespace (dns-servers/sntp-servers/domain-search).
+    # Global option-data: v4 gets DNS/NTP/domain-name as first-class fields,
+    # v6 gets its own namespace (dns-servers/sntp-servers/domain-search).
+    # Anything else the operator configured — including options this page has
+    # no concept of, such as a custom option defined outside EZ-KEA — comes
+    # back through the free-form table and is merged in by name.
     if version == "6":
+        managed_names = _MANAGED_V6_OPTIONS
         managed_options = {
             "dns-servers": request.form.get("opt-dns6", "").strip(),
             "sntp-servers": request.form.get("opt-sntp6", "").strip(),
             "domain-search": request.form.get("opt-domain-search6", "").strip(),
         }
     else:
+        managed_names = _MANAGED_V4_OPTIONS
         managed_options = {
             "domain-name-servers": request.form.get("opt-dns", "").strip(),
             "ntp-servers": request.form.get("opt-ntp", "").strip(),
             "domain-name": request.form.get("opt-domain", "").strip(),
         }
-    existing_opts = dhcp.get("option-data", [])
-    # Remove managed options then re-add non-empty ones
-    existing_opts = [o for o in existing_opts if o.get("name") not in managed_options]
-    for name, data in managed_options.items():
-        if data:
-            existing_opts.append({"name": name, "data": data})
-    dhcp["option-data"] = existing_opts
+    managed_options = {name: data for name, data in managed_options.items() if data}
+    managed_options.update(extra_options)
+    update_option_data(
+        dhcp, managed_options, managed=managed_names,
+        row_order=_managed_option_rows(version, managed_options) + option_rows,
+    )
+
+    apply_scope_params(dhcp, scope_params, boot_fields)
 
     save_kea_config(config, current_config_file, current_app.config["BACKUP_DIR"])
     return redirect(url_for(redirect_endpoint, **redirect_kwargs))
@@ -1132,7 +1234,14 @@ def _save_app_settings_impl(version: str) -> Union[Response, Tuple[str, int]]:
         for logger in loggers:
             if logger.get("name") == daemon["logger_name"]:
                 found_logger = True
-                opts = logger.setdefault("output-options", [{"output": log_file_path}])
+                # Kea spells this "output_options". A config written by an
+                # older EZ-KEA may carry the hyphenated variant, which Kea
+                # rejects outright ("got unexpected keyword") — normalise it
+                # in place rather than writing a second, differently-spelled
+                # key alongside it, which would break the logger either way.
+                if "output-options" in logger and "output_options" not in logger:
+                    logger["output_options"] = logger.pop("output-options")
+                opts = logger.setdefault("output_options", [{"output": log_file_path}])
                 if opts:
                     opts[0]["output"] = log_file_path
                 else:
@@ -1143,7 +1252,7 @@ def _save_app_settings_impl(version: str) -> Union[Response, Tuple[str, int]]:
                 "name": daemon["logger_name"],
                 "severity": "INFO",
                 "debuglevel": 0,
-                "output-options": [{"output": log_file_path}]
+                "output_options": [{"output": log_file_path}]
             })
     else:
         container = _docker_container_hint()
@@ -1169,6 +1278,138 @@ def _save_app_settings_impl(version: str) -> Union[Response, Tuple[str, int]]:
 
     save_kea_config(config, current_config_file, current_app.config["BACKUP_DIR"])
     return redirect(url_for(redirect_endpoint, **redirect_kwargs))
+
+# ── Advanced: raw Kea configuration editor ──────────────────────────────────
+#
+# Every structured form in EZ-KEA necessarily knows a fixed set of Kea keys;
+# this page is the general fallback for everything else (client-classes,
+# option-def/option-space, hooks, custom scope parameters). It edits the exact
+# document the daemon reads, so it is scoped to the whole file rather than to
+# one scope object -- a partially edited subtree would be ambiguous to merge
+# back into a file that may have changed since it was rendered.
+#
+# It is safe by the same mechanisms every other writer uses: a backup precedes
+# the write, the document must parse and carry the right root key before it is
+# written at all, and the result is handed to Kea's own syntax checker
+# afterwards. Backup/restore remains available if a bad-but-valid config is
+# applied.
+
+def _advanced_config_context(version: str) -> Dict[str, Any]:
+    daemon = _resolve_daemon_config(version)
+    config_file = daemon["config_file"]
+    root_key = daemon["dhcp_root_key"]
+
+    text = ""
+    try:
+        with open(config_file, "r") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        config = load_json(config_file, default=_DEFAULT_KEA6_CONFIG if version == "6" else None)
+        text = json.dumps(config, indent=2)
+    except PermissionError:
+        # load_json() turns this into the ConfigAccessError the app renders as
+        # a friendly 503 (see the error handler in __init__.py); re-reading it
+        # here keeps that single explanation rather than inventing a second.
+        load_json(config_file, default=_DEFAULT_KEA6_CONFIG if version == "6" else None)
+
+    return {
+        "version": version,
+        "config_file": config_file,
+        "root_key": root_key,
+        "config_text": text,
+    }
+
+
+@system_bp.route("/advanced-config")
+@login_required
+def advanced_config() -> str:
+    """Raw editor for the DHCPv4 Kea configuration document."""
+    return render_template("advanced_config.html", **_advanced_config_context("4"))
+
+
+@system_bp.route("/advanced-config/<version>")
+@login_required
+def advanced_config_version(version: str) -> Union[str, Tuple[str, int]]:
+    """Raw editor for the given DHCP version's Kea configuration document."""
+    if version not in ("4", "6"):
+        return "Unknown DHCP version — must be '4' or '6'", 400
+    return render_template("advanced_config.html", **_advanced_config_context(version))
+
+
+def _save_advanced_config_impl(version: str) -> Union[Response, Tuple[str, int]]:
+    """Validate and write a hand-edited Kea configuration document, then run
+    Kea's own syntax check against the result and report what it said."""
+    daemon = _resolve_daemon_config(version)
+    config_file = daemon["config_file"]
+    root_key = daemon["dhcp_root_key"]
+    redirect_endpoint = "main.system.advanced_config" if version == "4" else "main.system.advanced_config_version"
+    redirect_kwargs = {} if version == "4" else {"version": version}
+
+    submitted = request.form.get("config-json", "")
+    context = _advanced_config_context(version)
+    context["config_text"] = submitted
+
+    # Kea's parser accepts //, #, and /* */ comments; accept them here too so
+    # a document pasted back out of an ISC-shipped config isn't rejected for
+    # syntax Kea itself is happy with. parse_constant rejects the JSON5-ish
+    # NaN/Infinity literals json.loads would otherwise accept.
+    from ..core.config_manager import _strip_json_comments
+    try:
+        parsed = json.loads(
+            _strip_json_comments(submitted),
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as e:
+        position = f" at line {e.lineno}, column {e.colno}" if isinstance(e, json.JSONDecodeError) else ""
+        context["errors"] = [f"Not valid JSON{position}: {e.msg if isinstance(e, json.JSONDecodeError) else e}."]
+        return render_template("advanced_config.html", **context), 400
+
+    if not isinstance(parsed, dict) or root_key not in parsed:
+        context["errors"] = [
+            f"The document must be a JSON object containing a \"{root_key}\" key "
+            f"(the root of a Kea {root_key.replace('Dhcp', 'DHCP')} configuration)."
+        ]
+        return render_template("advanced_config.html", **context), 400
+
+    # Kea's own parser is the authority on whether this document is loadable,
+    # and this is the page where arbitrary Kea syntax gets typed -- so the save
+    # is rolled back when Kea refuses it rather than leaving a file the daemon
+    # cannot load. The operator's text stays in the editor either way.
+    from ..core.config_validate import InvalidConfigError, save_validated_kea_config
+    try:
+        warning = save_validated_kea_config(
+            parsed, config_file, current_app.config["BACKUP_DIR"],
+            dict(current_app.config), dhcp_key=daemon["dhcp_root_key"],
+        )
+    except InvalidConfigError as e:
+        context["errors"] = [e.message]
+        return render_template("advanced_config.html", **context), 400
+
+    if warning:
+        flash(f"Configuration saved, but the syntax check could not be run: {warning}", "warning")
+    else:
+        flash("Configuration saved and accepted by Kea's syntax check. "
+              "Apply Changes to make the daemon reload it.", "success")
+    return redirect(url_for(redirect_endpoint, **redirect_kwargs))
+
+
+@system_bp.route("/save-advanced-config", methods=["POST"])
+@login_required
+@with_config_lock()
+def save_advanced_config() -> Union[Response, Tuple[str, int]]:
+    """Save the raw DHCPv4 configuration document."""
+    return _save_advanced_config_impl("4")
+
+
+@system_bp.route("/save-advanced-config/<version>", methods=["POST"])
+@login_required
+@with_config_lock("DHCP6_CONFIG_FILE")
+def save_advanced_config_version(version: str) -> Union[Response, Tuple[str, int]]:
+    """Save the raw configuration document for the given DHCP version."""
+    if version not in ("4", "6"):
+        return "Unknown DHCP version — must be '4' or '6'", 400
+    return _save_advanced_config_impl(version)
+
 
 @system_bp.route("/save-global-settings", methods=["POST"])
 @login_required

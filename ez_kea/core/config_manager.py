@@ -12,6 +12,7 @@ import hashlib
 import threading
 from contextlib import contextmanager
 from functools import wraps
+from typing import Any, Dict, Optional, Tuple
 
 
 class ConfigAccessError(Exception):
@@ -67,7 +68,7 @@ _DEFAULT_KEA_CONFIG = {
         "loggers": [
             {
                 "name": "kea-dhcp4",
-                "output-options": [
+                "output_options": [
                     {
                         "output": "/var/log/kea/kea-dhcp4.log",
                         "maxver": 8,
@@ -111,7 +112,7 @@ _DEFAULT_KEA6_CONFIG = {
         "loggers": [
             {
                 "name": "kea-dhcp6",
-                "output-options": [
+                "output_options": [
                     {
                         "output": "/var/log/kea/kea-dhcp6.log",
                         "maxver": 8,
@@ -314,14 +315,19 @@ def with_config_lock(config_key: str = "DHCP_CONFIG_FILE", default: Optional[str
 def extract_log_file_from_config(config_file: str, default_fallback: str, dhcp_key: str = "Dhcp4", logger_name: str = "kea-dhcp4") -> str:
     """
     Attempts to read the Kea configuration file and extract the log file path
-    from <dhcp_key> -> loggers -> output-options. Falls back to default_fallback.
+    from <dhcp_key> -> loggers -> output_options. Falls back to default_fallback.
     """
     try:
         config = load_json(config_file, default=_DEFAULT_KEA6_CONFIG if dhcp_key == "Dhcp6" else None)
         loggers = config.get(dhcp_key, {}).get("loggers", [])
         for logger in loggers:
             if logger.get("name") == logger_name:
-                for opt in logger.get("output-options", []):
+                # Kea spells this "output_options"; the hyphenated variant is a
+                # historical EZ-KEA typo that some installs still carry in their
+                # config file, so read either rather than silently ignoring a
+                # logger that is really configured.
+                outputs = logger.get("output_options", logger.get("output-options", []))
+                for opt in outputs:
                     output_path = opt.get("output", "")
                     if output_path and output_path not in ("stdout", "stderr"):
                         return output_path
@@ -343,23 +349,25 @@ def to_legacy_control_socket(config: Dict[str, Any]) -> Dict[str, Any]:
     Rewrite a skeleton's Kea 3.0+ `control-sockets` list back to the pre-3.0
     singular `control-socket` object, for a daemon old enough to require it.
 
-    Only the first entry survives, which is lossless for our own skeletons
-    (they define exactly one UNIX socket) and is the only thing a pre-3.0 Kea
-    could have expressed anyway. Returns a new dict; the input is untouched.
+    Only the first socket entry survives, which is lossless for our own
+    skeletons (they define exactly one UNIX socket) and is the only thing a
+    pre-3.0 Kea could have expressed anyway. Returns a new dict; the input is
+    untouched.
     """
     rewritten: Dict[str, Any] = {}
     for dhcp_key, daemon in config.items():
-        sockets = daemon.get("control-sockets") if isinstance(daemon, dict) else None
-        if not isinstance(sockets, list) or not sockets:
+        if not isinstance(daemon, dict):
             rewritten[dhcp_key] = daemon
             continue
-        # Rebuild key-by-key so the socket stays where it was in the file
-        # rather than being popped to the end.
-        rewritten[dhcp_key] = {
-            ("control-socket" if key == "control-sockets" else key):
-                (sockets[0] if key == "control-sockets" else value)
-            for key, value in daemon.items()
-        }
+        rewritten_daemon: Dict[str, Any] = {}
+        for key, value in daemon.items():
+            # Rebuild key-by-key so each entry stays where it was in the file
+            # rather than being popped to the end.
+            if key == "control-sockets" and isinstance(value, list) and value:
+                rewritten_daemon["control-socket"] = value[0]
+            else:
+                rewritten_daemon[key] = value
+        rewritten[dhcp_key] = rewritten_daemon
     return rewritten
 
 
@@ -434,20 +442,13 @@ def prune_backups(config_file: str, backup_dir: str, keep: int) -> None:
             pass  # a backup we couldn't delete is not worth failing a config write over
 
 
-def save_kea_config(
+def _write_kea_config(
     data: Dict[str, Any], file_path: str, backup_dir: str, keep_backups: int = 100
 ) -> None:
-    """
-    Write a Kea config file, backing up the previous contents first.
+    """Back up and write, no questions asked. The guts of save_kea_config.
 
-    This is the only function that should ever write a *Kea* config. Plain
-    save_json() does not back anything up, and using it directly for a config
-    EZ-KEA manages is what let "backs up your Kea configs before it writes"
-    quietly become untrue for every edit path except the explicit Backup button.
-
-    A failed backup aborts the write (BackupError) rather than proceeding
-    without one -- an operator relying on that guarantee during a bad edit is
-    exactly who gets hurt if we write anyway.
+    Split out so that save_validated_kea_config can reuse the backup-and-write
+    step without recursing back into the validating wrapper.
     """
     if os.path.isfile(file_path):
         try:
@@ -462,6 +463,65 @@ def save_kea_config(
         prune_backups(file_path, backup_dir, keep_backups)
 
     save_json(data, file_path)
+
+
+def _validation_context(file_path: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    The app config to validate against, and which daemon owns this file.
+
+    Returns (None, "Dhcp4") when there is no app context or the file is not one
+    of the two Kea configs this app manages -- in that case the write is the
+    plain backup-and-write it always was.
+    """
+    try:
+        from flask import current_app, has_app_context
+    except Exception:  # pragma: no cover - flask is a hard dependency
+        return None, "Dhcp4"
+    if not has_app_context():
+        return None, "Dhcp4"
+    config = current_app.config
+    target = os.path.realpath(file_path)
+    for key, dhcp_key in (("DHCP_CONFIG_FILE", "Dhcp4"), ("DHCP6_CONFIG_FILE", "Dhcp6")):
+        configured = config.get(key)
+        if configured and os.path.realpath(str(configured)) == target:
+            return dict(config), dhcp_key
+    return None, "Dhcp4"
+
+
+def save_kea_config(
+    data: Dict[str, Any], file_path: str, backup_dir: str, keep_backups: int = 100
+) -> Optional[str]:
+    """
+    Write a Kea config file: back it up, then write it only if Kea accepts it.
+
+    This is the only function that should ever write a *Kea* config. Plain
+    save_json() does not back anything up, and using it directly for a config
+    EZ-KEA manages is what let "backs up your Kea configs before it writes"
+    quietly become untrue for every edit path except the explicit Backup button.
+
+    A failed backup aborts the write (BackupError) rather than proceeding
+    without one -- an operator relying on that guarantee during a bad edit is
+    exactly who gets hurt if we write anyway.
+
+    Inside a request, the candidate is also handed to the daemon's own syntax
+    check and rolled back if Kea refuses it (see core/config_validate.py). That
+    check lives here rather than in each route so that a route added later
+    cannot quietly reintroduce "saved, but the daemon will not load it" -- which
+    is exactly what happened to reservations and subnets.
+
+    Returns a warning string when the check could not be run (no Kea binary on
+    this host); None on success. Raises InvalidConfigError if Kea refused it.
+    """
+    app_config, dhcp_key = _validation_context(file_path)
+    if app_config is not None:
+        from .config_validate import save_validated_kea_config
+
+        return save_validated_kea_config(
+            data, file_path, backup_dir, app_config,
+            dhcp_key=dhcp_key, keep_backups=keep_backups,
+        )
+    _write_kea_config(data, file_path, backup_dir, keep_backups)
+    return None
 
 
 def _config_identity(config_file: str) -> str:

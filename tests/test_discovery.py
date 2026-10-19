@@ -75,3 +75,61 @@ def test_discover_environment6_independent_of_v4_mode(tmp_path):
 
     assert v4_result["mode"] == "LIVE"
     assert v6_result["mode"] == "DEMO"
+
+def test_explicit_config_path_beats_a_packaged_default(tmp_path):
+    """DHCP_CONFIG_FILE set in the environment is the file to manage, even when
+    the Kea package left /etc/kea/kea-dhcp4.conf behind. Silently managing the
+    package default instead would send every edit somewhere the operator is not
+    looking."""
+    config = _app_config(
+        tmp_path,
+        DHCP_CONFIG_FILE="/srv/kea/kea-dhcp4.conf",
+        DHCP_CONFIG_FILE_EXPLICIT=True,
+    )
+    with patch("ez_kea.core.discovery.find_kea_process", return_value={}):
+        with patch("os.path.isfile", return_value=True):
+            result = discover_environment(config)
+    assert result["dhcp_config_file"] == "/srv/kea/kea-dhcp4.conf"
+    assert result["mode"] == "LIVE"
+
+
+def test_explicit_config_path_is_honoured_before_the_file_exists(tmp_path):
+    """A path the operator configured is also where the skeleton must be
+    bootstrapped, so an existing /etc/kea config must not win just by existing."""
+    config = _app_config(
+        tmp_path,
+        DHCP_CONFIG_FILE="/srv/kea/kea-dhcp4.conf",
+        DHCP_CONFIG_FILE_EXPLICIT=True,
+    )
+    with patch("ez_kea.core.discovery.find_kea_process", return_value={}):
+        with patch("os.path.isfile", return_value=False):
+            result = discover_environment(config)
+    assert result["dhcp_config_file"] == "/srv/kea/kea-dhcp4.conf"
+
+
+def test_unset_config_path_falls_back_to_a_packaged_install(tmp_path):
+    """When nothing was configured explicitly and the configured path is not on
+    disk, discovery must still find a packaged Kea install -- that is the whole
+    point of auto-discovery."""
+    config = _app_config(tmp_path, DHCP_CONFIG_FILE="/srv/kea/kea-dhcp4.conf")
+    standard = {"/etc/kea/kea-dhcp4.conf", "/usr/local/etc/kea/kea-dhcp4.conf"}
+
+    def only_standard_on_disk(path):
+        return str(path) in standard
+
+    with patch("ez_kea.core.discovery.find_kea_process", return_value={}):
+        with patch("os.path.isfile", side_effect=only_standard_on_disk):
+            result = discover_environment(config)
+    assert result["dhcp_config_file"] == "/etc/kea/kea-dhcp4.conf"
+
+
+def test_explicit_config_path6_beats_a_packaged_default(tmp_path):
+    config = _app_config(
+        tmp_path,
+        DHCP6_CONFIG_FILE="/srv/kea/kea-dhcp6.conf",
+        DHCP6_CONFIG_FILE_EXPLICIT=True,
+    )
+    with patch("ez_kea.core.discovery.find_kea_process", return_value={}):
+        with patch("os.path.isfile", return_value=True):
+            result = discover_environment6(config)
+    assert result["dhcp6_config_file"] == "/srv/kea/kea-dhcp6.conf"

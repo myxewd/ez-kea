@@ -7,7 +7,7 @@ import re
 import warnings
 import time
 import csv
-from typing import Any, Dict, List, Set, Union
+from typing import Any, Dict, List, Set, Tuple, Union
 
 def classify_network_address(address: str) -> int:
     """
@@ -53,6 +53,276 @@ def validate_option_data(value: str) -> bool:
     if '<' in value or '>' in value:
         return False
     return True
+
+# ── Kea scope-level "boot" parameters ────────────────────────────────────────
+#
+# These are top-level keys on a Kea scope object (Dhcp4, a shared-network, a
+# subnet4, a reservation) that are carried in the fixed BOOTP header fields of
+# the packet rather than in the DHCP options area:
+#
+#   next-server     -> siaddr   (the host to fetch the boot file from)
+#   server-hostname -> sname
+#   boot-file-name  -> file
+#
+# They are NOT options and cannot be expressed through option-data: the BOOTP
+# header predates the options field, and no option code maps onto it. That is
+# why Kea exposes them as ordinary scope keys alongside valid-lifetime and
+# option-data, rather than as option names.
+#
+# next-server and server-hostname share their meaning with options 66 and 67,
+# but are not the same thing as those options -- 66/67 are written into the
+# options field, these write the BOOTP header. Kea exposes both; clients
+# differ in which they read, so a real config frequently sets both.
+#
+# Only "next-server" has a type Kea constrains (an IPv4 address -- Kea rejects
+# a hostname there). The other two are free-form strings that may contain a
+# URL, so they are validated only against control characters, like option-data.
+V4_BOOT_FIELDS = ("next-server", "server-hostname", "boot-file-name")
+# DHCPv6 has no BOOTP header at all, so none of the v4 names apply there.
+V6_BOOT_FIELDS: tuple = ()
+
+
+def boot_fields_for(dhcp_key: str) -> tuple:
+    """The Kea fixed-header scope parameters valid for a config root key
+    ("Dhcp4" / "Dhcp6"). Anything not listed is an option."""
+    return V4_BOOT_FIELDS if dhcp_key == "Dhcp4" else V6_BOOT_FIELDS
+
+
+def validate_ip_or_hostname(value: str) -> bool:
+    """
+    True when a value is usable as a server address: a literal IPv4 address,
+    or a plausible hostname/FQDN.
+
+    Deliberately permissive about hostnames -- Kea itself is the authority on
+    whether a given boot server is reachable, and this only rejects obvious
+    typos and control-character smuggling, not anything Kea would accept.
+    """
+    if not validate_option_data(value):
+        return False
+    if validate_ipv4_address(value):
+        return True
+    return bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", value))
+
+
+def validate_boot_field(name: str, value: str) -> bool:
+    """Type-check one Kea fixed-header scope parameter. Returns False for a
+    value that would make the resulting config fail Kea's own syntax check."""
+    if name == "next-server":
+        return validate_ipv4_address(value)
+    return validate_option_data(value)
+
+
+def parse_scope_params(form: Any, valid_fields: tuple) -> "tuple[Dict[str, str], List[str]]":
+    """
+    Read `valid_fields` out of a submitted form for one Kea scope object.
+
+    Returns (params, errors) where params maps field name -> cleaned value for
+    every field that was present and non-blank. A field present but blank is
+    omitted from params: callers read that as "remove the key", which is how
+    an operator clears a value they previously set.
+
+    A field absent from the form entirely is not touched at all, so a form
+    that never rendered a given field can never clear it.
+    """
+    params: Dict[str, str] = {}
+    errors: List[str] = []
+    for name in valid_fields:
+        raw = form.get(name)
+        if raw is None:
+            continue
+        value = raw.strip()
+        if not value:
+            continue
+        if not validate_boot_field(name, value):
+            if name == "next-server":
+                errors.append(f"{name} must be a single IPv4 address (e.g. 192.168.1.10).")
+            else:
+                errors.append(f"{name} contains characters that are not allowed.")
+            continue
+        params[name] = value
+    return params, errors
+
+
+def apply_scope_params(scope: Dict[str, Any], params: Dict[str, str], valid_fields: tuple) -> None:
+    """
+    Write `params` onto a Kea scope object, deleting any listed field that was
+    intentionally left blank. Keys outside `valid_fields` are left exactly as
+    they were.
+    """
+    for name in valid_fields:
+        if name in params:
+            scope[name] = params[name]
+        else:
+            scope.pop(name, None)
+
+
+def update_option_data(scope: Dict[str, Any], updates: Dict[str, str],
+                      managed: Any = None, deletions: Any = None,
+                      row_order: Any = None) -> None:
+    """
+    Merge named options into a scope's option-data in place.
+
+    Replaces the old "rebuild option-data from the one field this form knows
+    about" pattern, which silently deleted every other option on the scope
+    (hand-written root-path, vendor suboptions, ...) the first time someone
+    saved an unrelated edit.
+
+    `updates` maps option name -> data. `deletions` names options the operator
+    explicitly asked to remove -- this has to be said out loud, because "the
+    name is absent from the submission" cannot mean "delete": the table only
+    renders options it already knows about, so an option the form never showed
+    would then be silently dropped.
+
+    `managed` names options this form owns and that must be dropped when the
+    form no longer supplies them (used by the global-settings presets, whose
+    blank field does mean "remove"). Pass None to only ever add/update.
+
+    `row_order` is the option tables' row order, as
+    [(config index, name, removed), ...] sorted by index. Supplying it switches
+    to a positional merge: the submitted rows are written back in the order the
+    operator saw them, so an option that was removed and then put back (the ✕
+    clicked twice) returns to its own place rather than jumping to the end --
+    which is what rebuilding the list from a name-keyed submission would do,
+    since by then the option is no longer in the config to be found.
+    """
+    existing = scope.get("option-data")
+    if not isinstance(existing, list):
+        existing = []
+    managed_set = set(managed) if managed is not None else set()
+    deleted_set = set(deletions or ())
+
+    if row_order is not None:
+        # Positional merge, for the option tables. Each submitted row knows the
+        # index it was rendered at, so this rebuilds the list in the order the
+        # operator saw -- new rows first (they were rendered after the existing
+        # ones), then anything the config holds that the form never showed.
+        by_name = {name: entry for name, entry in
+                   ((e.get("name"), e) for e in existing if isinstance(e, dict))}
+
+        result: List[Any] = []
+        placed: set = set()
+        for _index, name, removed in sorted(row_order, key=lambda r: r[0]):
+            if removed:
+                # Deleting wins over keeping: a name can only appear as both if
+                # a stale form submitted one row as removed and another present.
+                continue
+            if not name:
+                continue                       # an untouched blank seed row
+            if name in placed:
+                continue                       # legacy duplicate: first wins
+            placed.add(name)
+            entry = dict(by_name[name]) if name in by_name else {}
+            entry["name"] = name
+            entry["data"] = updates.get(name, entry.get("data", ""))
+            result.append(entry)
+
+        # Options the config holds that the form never rendered at all. A name
+        # that *did* appear (present or removed) has already been decided above,
+        # which is what makes a removal stick. The exceptions: entries that are
+        # not option dicts (put back untouched), and a form-owned preset the
+        # form chose not to supply (dropped).
+        rendered_names = {name for _i, name, _r in row_order if name}
+        for entry in existing:
+            if not isinstance(entry, dict):
+                result.append(entry)
+                continue
+            name = entry.get("name")
+            if name in placed or name in rendered_names or name in deleted_set:
+                continue
+            if name in managed_set and name not in updates:
+                continue
+            result.append(entry)
+
+        if result:
+            scope["option-data"] = result
+        else:
+            scope.pop("option-data", None)
+        return
+
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    for entry in existing:
+        if not isinstance(entry, dict):
+            merged.append(entry)
+            continue
+        name = entry.get("name")
+        if name in deleted_set:
+            # Explicitly removed by the operator.
+            continue
+        if name in updates:
+            # Newly supplied or edited: take the submitted value, and drop any
+            # legacy duplicate of the same name.
+            if name in seen:
+                continue
+            seen.add(name)
+            entry = dict(entry)
+            entry["data"] = updates[name]
+        elif name in managed_set:
+            # A form-owned option whose field was left blank: remove it.
+            continue
+        merged.append(entry)
+
+    for name, data in updates.items():
+        if name in seen or name in deleted_set:
+            continue
+        # Reuse the existing entry if there is one (any extra keys Kea
+        # accepts, e.g. always-send, are already carried over above); append
+        # only when this option isn't on the scope yet.
+        if not any(isinstance(e, dict) and e.get("name") == name for e in merged):
+            merged.append({"name": name, "data": data})
+
+    if merged:
+        scope["option-data"] = merged
+    else:
+        scope.pop("option-data", None)
+
+
+def _parse_option_rows(form: Any, prefix: str, max_rows: int) -> Tuple[Dict[str, str], set, list]:
+    """
+    Read one option table off a submitted form.
+
+    Every option table (global, client class, per-reservation) submits the same
+    three fields per row: `<prefix>-name-<i>`, `<prefix>-data-<i>` and
+    `<prefix>-deleted-<i>`. The delete field is what makes removal expressible:
+    a row whose name was simply cleared cannot mean "delete", because the table
+    only renders options it already knows about.
+
+    Returns (updates, row_order, errors), where row_order is
+    [(form index, name, removed), ...] in form order -- the positional merge in
+    update_option_data() needs the order, not just the set of names.
+    """
+    updates: Dict[str, str] = {}
+    row_order: List[Tuple[int, str, bool]] = []
+    errors: list = []
+    for index in range(max_rows):
+        name = (form.get(f"{prefix}-name-{index}") or "").strip()
+        data = (form.get(f"{prefix}-data-{index}") or "").strip()
+        removed = bool(form.get(f"{prefix}-deleted-{index}"))
+        if removed:
+            if name:
+                row_order.append((index, name, True))
+            continue
+        if not name and not data:
+            continue
+        if not name:
+            errors.append("An option row is missing its name.")
+            continue
+        if not data:
+            errors.append(f"Option '{name}' is missing its data.")
+            continue
+        if not validate_option_data(name) or not validate_option_data(data):
+            errors.append(f"Option '{name}' contains characters that are not allowed.")
+            continue
+        if name in updates:
+            errors.append(f"Option '{name}' is listed more than once.")
+            continue
+        updates[name] = data
+        row_order.append((index, name, False))
+    for index, name, removed in row_order:
+        if removed:
+            updates.pop(name, None)
+    return updates, row_order, errors
+
 
 def validate_mac_address(mac_address: str) -> bool:
     """Check if the provided string is a valid MAC address format."""

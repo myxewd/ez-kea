@@ -60,6 +60,8 @@ def discover_environment(app_config: Dict[str, Any]) -> Dict[str, str]:
     """
     Determines the operational mode (LIVE or DEMO) and config paths.
     1. If user explicitly overrode settings in UI (ez-kea-settings.json) -> Use those (LIVE/DEMO depends on path).
+    1b. If DHCP_CONFIG_FILE was set explicitly (an environment path, not the
+        built-in default) -> manage exactly that file.
     2. If kea-dhcp4 process is running -> Use its config (LIVE).
     3. If standard config file exists (/etc/kea/) -> Use it (LIVE).
     4. Otherwise -> Fallback to ./data/ (DEMO).
@@ -80,15 +82,29 @@ def discover_environment(app_config: Dict[str, Any]) -> Dict[str, str]:
             "kea_ctrl_cmd": settings["kea_ctrl_cmd"]
         }
 
+    # 1b. A path the operator configured explicitly wins over anything found by
+    # discovery: if they pointed EZ-KEA at a file, that is the file to manage,
+    # even when the Kea package left its own /etc/kea/kea-dhcp4.conf behind.
+    custom_path = app_config.get("DHCP_CONFIG_FILE")
+    if custom_path and app_config.get("DHCP_CONFIG_FILE_EXPLICIT"):
+        return {
+            "mode": "DEMO" if "data/kea" in custom_path else "LIVE",
+            "dhcp_config_file": custom_path,
+            "kea_dhcp4_cmd": app_config.get("KEA_DHCP4_CMD", "kea-dhcp4"),
+            "kea_ctrl_cmd": app_config.get("KEA_CTRL_CMD", "keactrl"),
+        }
+
     # 2. Check for running processes (Auto-Discovery)
     process_info = find_kea_process("kea-dhcp4")
     if process_info and process_info.get("config_file"):
-        kea_bin = "kea-dhcp4" # We know it's in PATH if it's running, or we could extract exact bin path
+        # an operator-configured command wins even when a process is found: it
+        # may be a docker exec wrapper, or a binary that is not on PATH
+        kea_bin = app_config.get("KEA_DHCP4_CMD", "kea-dhcp4")
         return {
             "mode": "LIVE",
             "dhcp_config_file": process_info["config_file"],
             "kea_dhcp4_cmd": kea_bin,
-            "kea_ctrl_cmd": "keactrl" # Assume standard
+            "kea_ctrl_cmd": app_config.get("KEA_CTRL_CMD", "keactrl") # Assume standard
         }
 
     # 3. Check for standard installation paths (even if not currently running)
@@ -105,8 +121,8 @@ def discover_environment(app_config: Dict[str, Any]) -> Dict[str, str]:
             return {
                 "mode": "LIVE",
                 "dhcp_config_file": path,
-                "kea_dhcp4_cmd": "kea-dhcp4",
-                "kea_ctrl_cmd": "keactrl"
+                "kea_dhcp4_cmd": app_config.get("KEA_DHCP4_CMD", "kea-dhcp4"),
+                "kea_ctrl_cmd": app_config.get("KEA_CTRL_CMD", "keactrl")
             }
 
     # 4. Fallback to Demo / Local mode
@@ -138,13 +154,23 @@ def discover_environment6(app_config: Dict[str, Any]) -> Dict[str, str]:
             "kea_ctrl_cmd": settings["kea_ctrl_cmd"]
         }
 
+    # 1b. Same rule as v4: an explicitly configured path is the path.
+    custom_path = app_config.get("DHCP6_CONFIG_FILE")
+    if custom_path and app_config.get("DHCP6_CONFIG_FILE_EXPLICIT"):
+        return {
+            "mode": "DEMO" if "data/kea" in custom_path else "LIVE",
+            "dhcp6_config_file": custom_path,
+            "kea_dhcp6_cmd": app_config.get("KEA_DHCP6_CMD", "kea-dhcp6"),
+            "kea_ctrl_cmd": app_config.get("KEA_CTRL_CMD", "keactrl"),
+        }
+
     process_info = find_kea_process("kea-dhcp6")
     if process_info and process_info.get("config_file"):
         return {
             "mode": "LIVE",
             "dhcp6_config_file": process_info["config_file"],
-            "kea_dhcp6_cmd": "kea-dhcp6",
-            "kea_ctrl_cmd": "keactrl"
+            "kea_dhcp6_cmd": app_config.get("KEA_DHCP6_CMD", "kea-dhcp6"),
+            "kea_ctrl_cmd": app_config.get("KEA_CTRL_CMD", "keactrl")
         }
 
     custom_path = app_config.get("DHCP6_CONFIG_FILE")
@@ -160,8 +186,8 @@ def discover_environment6(app_config: Dict[str, Any]) -> Dict[str, str]:
             return {
                 "mode": "LIVE",
                 "dhcp6_config_file": path,
-                "kea_dhcp6_cmd": "kea-dhcp6",
-                "kea_ctrl_cmd": "keactrl"
+                "kea_dhcp6_cmd": app_config.get("KEA_DHCP6_CMD", "kea-dhcp6"),
+                "kea_ctrl_cmd": app_config.get("KEA_CTRL_CMD", "keactrl")
             }
 
     return {

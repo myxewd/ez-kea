@@ -1,6 +1,9 @@
 {% extends "base.html" %}
+{% import "_option_rows.html" as row_macro %}
+{% import "_icons.html" as icons %}
 
-{% block title %}{{ 'Edit MAC Reservation' if editing else 'New MAC Reservation' }} - EZ-KEA{% endblock %}
+{% block title %}{{ 'Edit MAC Reservation' if editing else 'New MAC Reservation' }} - EZ-KEA
+{% endblock %}
 
 {% block content %}
 <div class="page-header">
@@ -85,6 +88,76 @@
 
       <hr style="border-color: var(--card-border); margin: 2rem 0;">
 
+      <h3 style="font-size:1rem;color:var(--text-secondary);margin-bottom:.5rem;">
+        <i data-lucide="server-cog" style="width:16px;height:16px;"></i> Boot Parameters <span style="font-weight:400;font-size:.8rem;">(optional)</span>
+      </h3>
+      {# sname is legal but read by no PXE/iPXE client: carried through, not offered. #}
+      <input type="hidden" name="server-hostname" value="{{ scope_params.get('server-hostname', '') if scope_params else '' }}">
+      <div class="row" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1.5rem;">
+        <div class="form-group">
+          <label for="next-server" class="form-label">Next Server <span style="color:var(--text-secondary);font-size:.75rem;">siaddr, IPv4</span></label>
+          <input type="text" class="form-control" id="next-server" name="next-server"
+            value="{{ scope_params.get('next-server', '') if scope_params else '' }}" placeholder="optional">
+        </div>
+        <div class="form-group">
+          <label for="boot-file-name" class="form-label">Boot File Name <span style="color:var(--text-secondary);font-size:.75rem;">file</span></label>
+          <input type="text" class="form-control" id="boot-file-name" name="boot-file-name"
+            value="{{ scope_params.get('boot-file-name', '') if scope_params else '' }}" placeholder="an iPXE script, e.g. san-node-1.ipxe">
+        </div>
+      </div>
+
+      <hr style="border-color: var(--card-border); margin: 2rem 0;">
+
+      <h3 style="font-size:1rem;color:var(--text-secondary);margin-bottom:.5rem;">
+        <i data-lucide="sliders-horizontal" style="width:16px;height:16px;"></i> Options for This Host <span style="font-weight:400;font-size:.8rem;">(optional)</span>
+      </h3>
+      <p style="color:var(--text-secondary);font-size:.85rem;margin-bottom:1rem;">
+        DHCP options sent only to this host, by name &mdash; any option Kea accepts, including
+        one defined with <code>option-def</code>. Existing rows are shown so they are preserved;
+        use the ✕ to remove one, and Add Option for another row. These take precedence
+        over the subnet's options for this client.
+      </p>
+      <div class="table-container" style="margin-bottom:.5rem;">
+        <table id="res-option-table">
+          <thead>
+            <tr>
+              <th style="width:3rem;text-align:center;" title="Remove this option">&nbsp;</th>
+              <th style="width:35%;">Option Name</th>
+              <th>Option Data</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% set rows = option_rows if option_rows else [] %}
+            {% for name, data, saved in rows %}
+            {{ row_macro.option_row('res-option', loop.index0, name,
+                                    data if data is not none else '',
+                                    saved=saved, deleted=(data is none),
+                                    data_placeholder='value sent to this host') }}
+            {% endfor %}
+            <tr class="option-template" style="display:none;">
+              <td style="text-align:center;">
+                <input type="hidden" name="__PREFIX__-deleted-__INDEX__" value="">
+                <button type="button" class="btn btn-danger btn-sm"
+                        onclick="removeOptionRow(this, '__PREFIX__')">
+                  {{ icons.icon_x(18) }}
+                </button>
+              </td>
+              <td><input type="text" class="form-control" name="__PREFIX__-name-__INDEX__"
+                         placeholder="e.g. root-path" style="font-family:ui-monospace,monospace;"
+                         oninput="syncRemovedName(this)"></td>
+              <td><input type="text" class="form-control" name="__PREFIX__-data-__INDEX__"
+                         placeholder="value sent to this host"></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <button type="button" class="btn btn-outline btn-sm"
+              onclick="addOptionRow('res-option-table','res-option')">
+        <i data-lucide="plus"></i> Add Option
+      </button>
+
+
+      <hr style="border-color: var(--card-border); margin: 2rem 0;">
       <div style="display: flex; justify-content: flex-end;">
         <button type="submit" class="btn btn-primary">
           <i data-lucide="check"></i> {{ 'Save Changes' if editing else 'Create Reservation' }}
@@ -122,3 +195,4 @@
 </script>
 {% endif %}
 {% endblock %}
+{% include '_option_rows.html' %}

@@ -11,8 +11,16 @@ class Config:
     DHCP_LEASES_FILE = os.getenv("DHCP_LEASES_FILE", "./data/kea-leases4.csv")
     DHCP_LOG_FILE    = os.getenv("DHCP_LOG_FILE",    "./data/kea-dhcp4.log")
 
+    # Whether the path above was actually chosen by the operator (as opposed to
+    # being this file's default). Auto-discovery uses this: a path you set
+    # explicitly is where EZ-KEA must work, even when the Kea package happens to
+    # have installed its own /etc/kea/kea-dhcp4.conf — silently managing that
+    # file instead would mean every edit lands somewhere you are not looking.
+    DHCP_CONFIG_FILE_EXPLICIT = os.getenv("DHCP_CONFIG_FILE") is not None
+
     # DHCPv6 equivalents — mirror the DHCPv4 settings above exactly.
     DHCP6_CONFIG_FILE = os.getenv("DHCP6_CONFIG_FILE", "./data/kea-dhcp6.conf")
+    DHCP6_CONFIG_FILE_EXPLICIT = os.getenv("DHCP6_CONFIG_FILE") is not None
     DHCP6_LEASES_FILE = os.getenv("DHCP6_LEASES_FILE", "./data/kea-leases6.csv")
     DHCP6_LOG_FILE    = os.getenv("DHCP6_LOG_FILE",    "./data/kea-dhcp6.log")
 

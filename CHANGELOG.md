@@ -10,6 +10,149 @@ reads and always backs it up first.
 
 ## [Unreleased]
 
+### Added
+
+- **Client-class editor.** Kea's `client-classes` are now editable at both
+  DHCP versions: name, the `test` expression, the DHCPv4 fixed-header fields
+  (`next-server` / `boot-file-name`), and per-class `option-data`.
+  Classification is a standard Kea configuration surface, like shared networks
+  or prefix delegation, so the page is written in those terms and says nothing
+  about what any class is for. Expressions are stored verbatim and judged by
+  Kea's own parser at Test Config / Apply Changes; EZ-KEA validates what it can
+  (a name collision, a non-IPv4 `next-server`, a missing expression) and
+  otherwise stays out of the way. Reachable from the IPv4 and IPv6 menus.
+- **Per-host DHCP options.** A reservation can now carry its own
+  `option-data` (Kea's *Including Specific DHCPv4 Options in Reservations*),
+  edited as name/data rows like the global and class editors. This is the
+  right scope for "this one machine needs a different root-path / DNS /
+  vendor option" without carving out a subnet or defining a class for it.
+  Editing a reservation merges by name, so options the form does not own
+  survive.
+- **Per-host column on the reservations list.** Rows now show what a host
+  overrides beyond its address: the boot fields it sets, any client classes
+  it is reserved into, and how many options are configured on it. The index
+  schema grew the three columns needed for this (`options_count`,
+  `boot_config`, `classes`), added through the existing migration path; the
+  CSV export carries the same facts.
+- **Kea's fixed BOOTP-header parameters are now editable, at every scope that
+  supports them.** `next-server` (`siaddr`) and `boot-file-name` (`file`) are
+  ordinary scope keys in Kea, not options, so they were previously unreachable
+  from EZ-KEA's option forms — and no option can stand in for `next-server`,
+  which has no option code at all. Both are now fields on the global settings
+  page, on subnet create/edit, and on reservation create/edit, so a single host
+  can override the boot source without its own subnet. Blank means "remove the
+  key"; `next-server` must be an IPv4 address. `server-hostname` (`sname`) is
+  read by neither PXE nor iPXE firmware, so it is not offered as a field; a
+  value already in the file is preserved through a save and stays editable on
+  the Advanced Configuration page.
+- **Global DHCP options are no longer limited to three presets.** The global
+  settings page gains a free-form name/data table for any other option Kea
+  accepts there, and renders every non-preset option already configured so a
+  save round-trips it unchanged.
+- **Advanced Configuration page** (`/advanced-config`, linked from both DHCP
+  menus) — a raw editor for the whole Kea configuration document, reachable
+  when a setting has no form: `client-classes`, `option-def`/`option-space`,
+  hooks, vendor-specific scope parameters. It accepts Kea's `//`, `#` and
+  `/* */` comments, refuses a document that isn't JSON or lacks the
+  `Dhcp4`/`Dhcp6` root key, backs up before writing, and then hands the
+  result to Kea's own syntax checker and reports what it said.
+- **Saves are checked by Kea itself before they are kept.** A candidate config
+  is written, handed to the daemon's own `-t` syntax check, and rolled back
+  from the pre-write backup when Kea refuses it — so a config the daemon cannot
+  load never lands on disk. This began as a guard on the client-class editor
+  and the raw Advanced Configuration editor, the two places where arbitrary Kea
+  syntax (class expressions above all) is typed, and now backs every write (see
+  Fixed). When the check cannot be run at all (no Kea binary on this host, a
+  timeout) the save still goes through and the operator is warned, because an
+  environment problem must not make EZ-KEA unable to save. The Test Config
+  button and the save path share one implementation
+  (core/config_validate.py), so they cannot disagree about what Kea accepts.
+
+### Fixed
+
+- **Every Kea config write is now gated on Kea accepting it, not just the
+  client-class and raw editors.** Those two called `save_validated_kea_config`;
+  the subnet, reservation, option and global-settings forms called
+  `save_kea_config`, which backs up and writes but never asked the daemon. A
+  reservation with a fixed address outside its subnet was written happily and
+  the next Kea reload died on it (`specified reservation '10.99.0.5' is not
+  within the IPv4 subnet '10.77.0.0/24'`). The check now lives in
+  `save_kea_config` itself, so no route can skip it, and a refusal raises
+  `InvalidConfigError` with Kea's own words after restoring the previous file.
+- **A DHCP option could not be removed from a client class, a reservation or
+  the global settings page.** The only way to express "remove this" was to
+  clear the row's name, and the parser read a blank row as "nothing said about
+  this option" — so the option stayed put and deleting it looked broken. Each
+  option row now has a red ✕: for a row that exists in the config it strikes
+  the row through and records the removal (submitted as `…-deleted-<i>`), which
+  the merge honours on save — including when the last option on a scope is
+  removed, where the key goes away rather than becoming an empty list. For a
+  row added in the same edit there is nothing on disk to remove, so the ✕ just
+  drops the row. Clicking the same ✕ again puts a removed row back — the
+  button is a toggle (its icon and label change), so a mis-click is undoable
+  right up until the save.
+- **Options keep their order when a row is removed and put back.** The merge
+  rebuilt the list from a name-keyed submission, so an option that had already
+  been removed was no longer in the config to be found and came back at the
+  end. Each submitted row now carries the position it was rendered at, and the
+  list is written back in that order.
+- **A blank option table gave you nothing to type into.** The three option
+  tables now seed a couple of blank rows, and "Add Option" appends more, so
+  any number of options can be entered in one save instead of re-opening the
+  form for each one.
+- **The option tables' remove button could render collapsed to a sliver.** Its
+  icon was a `<i data-lucide="x">` left for lucide to swap for an `<svg>` when
+  the page loaded — but the row it lived in is `display:none` and gets *cloned*
+  later by "Add Option", so a clone could carry a bare `<i>`, which has no box
+  of its own: the button was then only as tall as its padding. Icons in that row
+  are now emitted server-side as real SVG (templates/_icons.html), so nothing
+  depends on when lucide runs, and `.btn svg` states the icon's size once
+  instead of inheriting it from an attribute that may not be there.
+- **The client-class editor's example expressions were wrong for real clients.**
+  The hint suggested `substring(option[60].hex, 0, 4) == 'iPXE'` and
+  `substring(option[77].hex, 2, 4) == 'iPXE'`; tested against an actual iPXE
+  (1.0.0+git-20190125, QEMU, real DHCP), neither matches. A loaded iPXE sends
+  the same `PXEClient:Arch:...:UNDI:...` vendor class as the firmware that
+  loaded it, so option 60 cannot separate the two stages at all, and option 77
+  arrives as `4d 04 69 50 58 45` — code, length, then the payload `iPXE` — so
+  `option[77].hex` is `69505845` and the offset is 0. The hint now shows
+  `substring(option[77].hex, 0, 4) == 'iPXE'`, which does match, and no longer
+  offers a `option[61]` MAC-prefix example: Kea 2.2.0 did not expose the
+  client-id that way in any of five forms tried.
+- **A config path you configured explicitly now wins over auto-discovery.**
+  With `DHCP_CONFIG_FILE` set (say `/kea/kea-dhcp4.conf`) but not yet on disk,
+  `discover_environment()` fell through to the packaged
+  `/etc/kea/kea-dhcp4.conf` and managed that instead: EZ-KEA edited, backed up
+  and rendered a file the operator had not pointed it at, while the configured
+  path was never even bootstrapped. `DHCP_CONFIG_FILE_EXPLICIT` (true when the
+  environment variable is present) now makes the configured path authoritative,
+  so the skeleton is created there and every later edit lands in the same file.
+  Same rule for `DHCP6_CONFIG_FILE`.
+- **A discovered config file no longer resets the configured daemon command.**
+  `discover_environment()` returned the hardcoded `"kea-dhcp4"` (and
+  `"keadctrl"` for the control binary) on the "config file found" paths, so a
+  deployment that sets `KEA_DHCP4_CMD=/shared/kea-dhcp4` had it replaced at
+  startup. The pre-save check then could not find the binary and silently
+  degraded to "saved, but the check could not be run" on every write — the
+  check appeared to be working while never running.
+- **Editing a subnet's gateway or a reservation no longer deleted that
+  scope's other options.** `edit_subnet()` rebuilt `option-data` from the one
+  field its form owns, so any option it didn't know about — a hand-written
+  `root-path`, a vendor suboption — vanished the first time someone changed
+  the router. Options are now merged by name, preserving everything the form
+  does not own.
+- **The generated Kea config carried the wrong logger key, which Kea refuses
+  to load.** Every skeleton and the app-settings log-path save emitted
+  `output-options` (hyphenated); Kea's parser rejects that with *"got
+  unexpected keyword"* and refuses to load the whole file — reproduced
+  against a real `kea-dhcp4` 2.0.2, whose `-t` accepts only the underscore
+  spelling `output_options` (the spelling this project's own Kea 3.2 testbed
+  config uses). A fresh install therefore bootstrapped a config the daemon it
+  was written for could not start with, and changing the log path broke a
+  working one. `extract_log_file_from_config()` now reads either spelling so
+  existing configs keep resolving, and the log-path save normalises a
+  hyphenated key in place rather than writing a second one alongside it.
+
 ## [0.9.2] — 2026-08-02
 
 ### Fixed
