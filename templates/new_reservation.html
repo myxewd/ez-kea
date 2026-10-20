@@ -102,7 +102,35 @@
         <div class="form-group">
           <label for="boot-file-name" class="form-label">Boot File Name <span style="color:var(--text-secondary);font-size:.75rem;">file</span></label>
           <input type="text" class="form-control" id="boot-file-name" name="boot-file-name"
-            value="{{ scope_params.get('boot-file-name', '') if scope_params else '' }}" placeholder="an iPXE script, e.g. san-node-1.ipxe">
+            value="{{ '' if (ipxe and ipxe.enabled) else (scope_params.get('boot-file-name', '') if scope_params else '') }}"
+            placeholder="an iPXE script, e.g. san-node-1.ipxe"
+            {% if ipxe and ipxe.enabled %}disabled{% endif %}>
+        </div>
+      </div>
+
+      <div class="form-group" style="margin-top:1rem;padding:1rem;border:1px solid var(--card-border);border-radius:8px;">
+        <label for="boot-with-ipxe" class="form-label" style="display:flex;align-items:center;gap:.5rem;margin-bottom:.25rem;">
+          <input type="checkbox" id="boot-with-ipxe" name="boot-with-ipxe" style="width:auto;margin:0;"
+                 {% if ipxe and ipxe.enabled %}checked{% endif %}>
+          <span>Boot with iPXE</span>
+        </label>
+        <p class="text-secondary" style="font-size:.8rem;margin:0 0 .75rem 0;">
+          Give this host its own iPXE script. The script is delivered only once iPXE is
+          running (the NIC firmware still receives the normal boot file), so EZ-KEA writes it
+          as a client class for this host &mdash; named <code>ez-kea-ipxe-&lt;mac&gt;-&lt;subnet&gt;</code>,
+          kept at the top of the class list so it outranks a general iPXE class, and bound to
+          this reservation: it cannot be edited from the Client Classes page.
+        </p>
+        <div id="ipxe-script-field">
+          <label for="ipxe-script" class="form-label">iPXE Script Address</label>
+          <input type="text" class="form-control" id="ipxe-script" name="ipxe-script"
+                 value="{{ ipxe.script if ipxe else '' }}"
+                 placeholder="http://boot.example.com/hosts/san-node-1.ipxe"
+                 style="font-family:ui-monospace,monospace;">
+          <p class="text-secondary" style="font-size:.75rem;margin-top:.25rem;">
+            A URL or a path this host's iPXE can fetch. While Boot with iPXE is on, the Boot
+            File Name field above is cleared and not used for this host.
+          </p>
         </div>
       </div>
 
@@ -166,6 +194,27 @@
     </form>
   </div>
 </div>
+
+<script>
+  document.addEventListener("DOMContentLoaded", function () {
+    const toggle = document.getElementById("boot-with-ipxe");
+    const field = document.getElementById("ipxe-script-field");
+    const bootFile = document.getElementById("boot-file-name");
+    const script = document.getElementById("ipxe-script");
+    if (!toggle) { return; }
+    // The script address is an alternative to the reservation's own
+    // boot-file-name, not a second copy of it: while it is on, the plain
+    // boot-file-name field is disabled so the two cannot disagree.
+    function sync() {
+      const on = toggle.checked;
+      if (field) { field.style.display = on ? "" : "none"; }
+      if (bootFile) { bootFile.disabled = on; }
+      if (script) { script.required = on; }
+    }
+    toggle.addEventListener("change", sync);
+    sync();
+  });
+</script>
 
 {% if not editing %}
 <script>

@@ -84,7 +84,7 @@ shared config directory:
 
 ```bash
 cd deploy
-docker build -t ez-kea:0.10.1 --build-arg EZK_REF=v0.10.1 ./ezkea
+docker build -t ez-kea:0.10.2 --build-arg EZK_REF=v0.10.2 ./ezkea
 docker build -t ez-kea-kea:2.2.0 ./kea
 cp kea.env.example kea.env      # set SECRET_KEY
 docker compose --env-file kea.env up -d
@@ -178,6 +178,7 @@ One Python process (waitress serving a Flask app) on the same host as Kea.
 - **DHCPv4 and DHCPv6** — shared networks, standalone subnets, address pools, and per-subnet DHCP options for both families. Subnets and shared networks are created, edited in place, and deleted through the UI (one address pool each per subnet). A subnet's CIDR is locked once created, but its gateway, pool range, and static-only toggle are editable; a shared network's name can be renamed. DHCP options are editable in place, and editing one field never discards the options a form doesn't know about.
 - **Client classes** — Kea's `client-classes` are editable at both DHCP versions: the name, the `test` expression, the DHCPv4 fixed-header fields (`next-server` / `boot-file-name`), and per-class `option-data`. Expressions are stored verbatim and validated by Kea's own parser, with EZ-KEA catching what it can (name collisions, a non-IPv4 `next-server`) before the write.
 - **Per-host options** — a reservation can carry its own DHCP options by name, so one machine can get a different `root-path`, DNS server or vendor option without a subnet or a class of its own. The reservations list shows what each host overrides (boot fields, client classes, option count).
+- **Per-host iPXE scripts** — tick **Boot with iPXE** on a reservation and enter the host's script address; EZ-KEA writes and maintains the Kea `client-class` that hands that host its script, only once iPXE is running (the firmware still gets the normal boot file), and ranks it ahead of a general iPXE class. The generated class is bound to the reservation: it is marked *Managed* and read-only on the Client Classes page, and is updated or removed with the reservation.
 - **Boot parameters and arbitrary configuration** — Kea's fixed BOOTP-header parameters (`next-server`/`siaddr` and `boot-file-name`/`file`; `server-hostname`/`sname` is readable by no PXE client and left to the raw editor) are ordinary scope keys rather than options, so they are edited as fields at global, subnet and reservation scope; global options are free-form by name. Anything with no form at all — `client-classes`, `option-def`/`option-space`, hooks — is reachable through a raw configuration editor that backs up first and then validates with Kea's own parser.
 - **Prefix delegation** — `pd-pools` with a delegated length, validated against the pool's own prefix, so downstream routers and CPE get a block rather than a single address.
 - **Reservations** — MAC-based for DHCPv4; DUID-based for DHCPv6, covering fixed addresses, delegated prefixes, or both on one reservation. Editable in place (MAC/DUID, IP, and hostname; the subnet is locked). The list pages have free-text search, a subnet CIDR filter, sortable columns, CSV export, and pagination.

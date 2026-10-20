@@ -10,6 +10,8 @@ reads and always backs it up first.
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-10-20
+
 ### Added
 
 - **Multiple Kea endpoints, selected from the navbar.** A new Endpoints page
@@ -94,10 +96,22 @@ reads and always backs it up first.
   survive.
 - **Per-host column on the reservations list.** Rows now show what a host
   overrides beyond its address: the boot fields it sets, any client classes
-  it is reserved into, and how many options are configured on it. The index
-  schema grew the three columns needed for this (`options_count`,
-  `boot_config`, `classes`), added through the existing migration path; the
-  CSV export carries the same facts.
+  it is reserved into, how many options are configured on it, and whether it
+  boots via iPXE. The index schema grew the columns needed for this
+  (`options_count`, `boot_config`, `classes`, `ipxe_script`), added through
+  the existing migration path; the CSV export carries the same facts.
+- **Per-host iPXE boot scripts, configured from the reservation.** A DHCPv4
+  reservation's Boot Parameters section gains a **Boot with iPXE** checkbox
+  and a script address. Saving it writes a Kea `client-class` for that host
+  whose expression requires both the host's MAC and iPXE's option 77 user
+  class, so the NIC firmware still receives the normal boot file and only the
+  loaded iPXE is handed the script. The class is named deterministically from
+  the reservation (`ez-kea-ipxe-<mac>-<subnet>`), kept first in
+  `client-classes` so it outranks a general "send every iPXE client this
+  script" class (Kea uses the first matching class's boot fields), and is bound
+  to the reservation: the Client Classes page shows it as *Managed* with a link
+  back instead of edit/delete, and it follows the reservation through edits,
+  MAC changes, deletes, and subnet/shared-network removal.
 - **Kea's fixed BOOTP-header parameters are now editable, at every scope that
   supports them.** `next-server` (`siaddr`) and `boot-file-name` (`file`) are
   ordinary scope keys in Kea, not options, so they were previously unreachable
@@ -216,6 +230,22 @@ reads and always backs it up first.
   working one. `extract_log_file_from_config()` now reads either spelling so
   existing configs keep resolving, and the log-path save normalises a
   hyphenated key in place rather than writing a second one alongside it.
+- **The Docker deployment's image did not build, and its healthcheck could
+  never pass.** The fetch stage copied `git` out of an Alpine image: even
+  when that path exists, the binary is linked against musl and cannot run on
+  this glibc base, and it checked out a bare `main` after fetching into
+  `refs/remotes/origin/*`, which git treats as a path. The checkout now
+  happens in a Debian fetch stage, with the requested ref fetched by name, so
+  a branch, tag and commit SHA all resolve; only the application tree is
+  copied into the runtime image. The
+  healthcheck already pointed at `/healthz`, which did not exist: there is now
+  an unauthenticated probe that returns 200 only when the database and the
+  managed Kea config are usable, 503 otherwise.
+- **The compose file mounted the Kea config directory read-only into the
+  one container that writes it.** EZ-KEA rewrites `/etc/kea/kea-dhcp4.conf` on
+  every save, so a read-only bind mount made that fail with EROFS and left the
+  deployment unable to change anything. The `ezkea` service now mounts
+  `${KEA_ROOT}/conf` read-write; the daemon's own mounts are unchanged.
 
 ## [0.9.2] — 2026-08-02
 
@@ -368,7 +398,8 @@ version on it so an install can be identified.
   note and nothing more.
 - Branding standardized on EZ-KEA.
 
-[Unreleased]: https://github.com/fenleytech/ez-kea/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/fenleytech/ez-kea/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/fenleytech/ez-kea/compare/v0.9.2...v0.10.2
 [0.9.2]: https://github.com/fenleytech/ez-kea/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/fenleytech/ez-kea/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/fenleytech/ez-kea/releases/tag/v0.9.0

@@ -82,8 +82,8 @@ tree, so "which version is deployed" has exactly one answer.
 git clone https://github.com/myxewd/ez-kea.git /srv/ez-kea-src
 cd /srv/ez-kea-src/deploy
 
-docker build -t ez-kea:0.10.1 \
-  --build-arg EZK_REF=v0.10.1 \
+docker build -t ez-kea:0.10.2 \
+  --build-arg EZK_REF=v0.10.2 \
   ./ezkea
 ```
 
@@ -96,10 +96,10 @@ docker build -t ez-kea:0.10.1 \
 What was built:
 
 ```bash
-docker run --rm --entrypoint cat ez-kea:0.10.1 /opt/ez-kea/.build-git-sha
+docker run --rm --entrypoint cat ez-kea:0.10.2 /opt/ez-kea/.build-git-sha
 ```
 
-For an air-gapped host, run `docker save ez-kea:0.10.1 | gzip > ez-kea-0.10.1.tgz`
+For an air-gapped host, run `docker save ez-kea:0.10.2 | gzip > ez-kea-0.10.2.tgz`
 where GitHub is reachable, then `docker load` there.
 
 ---

@@ -37,6 +37,11 @@ MAX_CLASS_NAME = 128
 # Upper bound on option rows accepted from one class form (see
 # routes/system.py's identical reasoning for global options).
 MAX_CLASS_OPTION_ROWS = 100
+# Names beginning with this prefix belong to classes EZ-KEA maintains itself
+# (currently the per-reservation iPXE classes in core/ipxe.py). They are not
+# ordinary classes: the editor refuses the namespace so an operator cannot
+# create, rename into, or edit one out from under its reservation.
+RESERVED_CLASS_PREFIX = "ez-kea-"
 # Option rows the form always renders so a new one can be typed in without
 # JavaScript.
 CLASS_OPTION_BLANK_ROWS = 2
@@ -111,6 +116,14 @@ def _validate_name(name: str, existing: Dict[str, Any], original: str, dhcp_key:
     # option fields already follow).
     if not validate_option_data(name):
         errors.append("Class name contains characters that are not allowed.")
+        return False
+    # Reserved for classes the app maintains from another page (see
+    # core/ipxe.py); editing one here would silently break its binding.
+    if name.startswith(RESERVED_CLASS_PREFIX):
+        errors.append(
+            f"Class names beginning with '{RESERVED_CLASS_PREFIX}' are reserved for "
+            "classes EZ-KEA generates and maintains from another page."
+        )
         return False
     if name != original and name in existing:
         errors.append(f"A client class named '{name}' already exists.")

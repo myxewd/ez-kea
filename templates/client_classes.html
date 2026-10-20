@@ -29,11 +29,18 @@
       carries &mdash; options, lease lifetimes, and (DHCPv4) the fixed BOOTP header fields
       <code>next-server</code> / <code>boot-file-name</code>.
     </p>
-    <p style="margin:0;color:var(--text-secondary);font-size:.9rem;">
+    <p style="margin:0 0 .5rem 0;color:var(--text-secondary);font-size:.9rem;">
       Expressions are written through exactly as typed and judged by Kea's own parser at
       <strong>Test Config</strong> &mdash; EZ-KEA does not attempt to interpret them, and it cannot tell
       you which class a real client will match. Kea's expression vocabulary is documented in the
       <a href="https://kea.readthedocs.io/en/kea-2.6.0/arm/classify.html" target="_blank" rel="noopener">Kea ARM, Client Classification</a>.
+    </p>
+    <p style="margin:0;color:var(--text-secondary);font-size:.9rem;">
+      Classes are tried in the order they appear below, and Kea uses the first matching class's
+      boot fields and options &mdash; so a class higher in the table outranks a later one. EZ-KEA keeps
+      the per-host iPXE classes it generates (marked <em>Managed</em>) at the top, which is what lets
+      one host's script outrank a general iPXE class; they are changed on the reservation that owns
+      them, not here.
     </p>
   </div>
 </div>
@@ -48,17 +55,25 @@
       <table>
         <thead>
           <tr>
+            <th style="width:3rem;" title="Kea uses the first matching class's boot fields and options; a lower order number wins">#</th>
             <th style="width:18%;">Name</th>
             <th>Expression</th>
             {% if not v6 %}<th style="width:22%;">BOOTP Header Fields</th>{% endif %}
             <th style="width:9%;">Options</th>
-            <th style="width:12%;text-align:right;">Action</th>
+            <th style="width:16%;text-align:right;">Action</th>
           </tr>
         </thead>
         <tbody>
           {% for entry in classes %}
           <tr>
-            <td style="font-weight:600;">{{ entry.name }}</td>
+            <td style="color:var(--text-secondary);font-variant-numeric:tabular-nums;">{{ loop.index }}</td>
+            <td style="font-weight:600;">
+              {{ entry.name }}
+              {% if entry.managed %}
+              <span class="badge" style="background:rgba(234,179,8,.15);color:#eab308;margin-left:.35rem;"
+                    title="Generated from a reservation's iPXE settings; edited there, not here">Managed</span>
+              {% endif %}
+            </td>
             <td>
               {% if entry.test %}
               <code style="font-size:.8rem;word-break:break-all;">{{ entry.test }}</code>
@@ -89,6 +104,34 @@
               {% endif %}
             </td>
             <td style="text-align:right;">
+              {% if entry.managed %}
+                {% if entry.owner %}
+                <div style="display:flex;gap:.25rem;justify-content:flex-end;align-items:center;">
+                  <span style="font-size:.72rem;color:var(--text-secondary);margin-right:.25rem;"
+                        title="Bound to this reservation; change its iPXE settings there">
+                    {{ entry.owner.hostname or entry.owner['hw-address'] }}
+                  </span>
+                  <a href="{{ url_for('main.dhcp4.edit_reservation', **{'hw-address': entry.owner['hw-address'], 'subnet': entry.owner['subnet']}) }}"
+                     class="btn btn-outline btn-sm" title="Open the reservation that owns this class"
+                     aria-label="Open the reservation that owns this class">
+                    <i data-lucide="pencil"></i>
+                  </a>
+                </div>
+                {% else %}
+                {# The reservation it belonged to is gone (usually a raw-config
+                   edit), so removing the leftover is cleanup, not an override. #}
+                <form action="{{ url_for('main.client_classes.delete_client_class_version', version=version) }}"
+                      method="POST" onsubmit="return confirm('This class has no reservation left. Delete it?');" style="margin:0;">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <input type="hidden" name="name" value="{{ entry.name }}">
+                  <button type="submit" class="btn btn-danger btn-sm"
+                          title="Orphaned: no reservation owns this class. Delete it."
+                          aria-label="Delete orphaned class">
+                    <i data-lucide="trash"></i> Orphaned
+                  </button>
+                </form>
+                {% endif %}
+              {% else %}
               <div style="display:flex;gap:.25rem;justify-content:flex-end;">
                 <a href="{{ url_for('main.client_classes.edit_client_class_version', version=version, name=entry.name) }}"
                    class="btn btn-outline btn-sm" title="Edit class" aria-label="Edit class">
@@ -103,6 +146,7 @@
                   </button>
                 </form>
               </div>
+              {% endif %}
             </td>
           </tr>
           {% endfor %}

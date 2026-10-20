@@ -53,6 +53,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from . import ipxe
 from .log_index import classify_term, normalize_mac, normalize_mac_prefix
 from .validation import V4_BOOT_FIELDS
 
@@ -184,7 +185,10 @@ CREATE TABLE IF NOT EXISTS state_reservation4 (
     -- beyond address/hostname (see _reservation_flags)
     options_count        INTEGER,
     boot_config          TEXT,
-    classes              TEXT
+    classes              TEXT,
+    -- the per-host iPXE script a reservation's generated client-class carries
+    -- (see core/ipxe.py); NULL when the host does not boot via iPXE
+    ipxe_script          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_res4_subnet ON state_reservation4(subnet);
 
@@ -253,6 +257,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         ("state_reservation4", "options_count", "INTEGER"),
         ("state_reservation4", "boot_config", "TEXT"),
         ("state_reservation4", "classes", "TEXT"),
+        ("state_reservation4", "ipxe_script", "TEXT"),
     )
     for table, column, column_type in added_columns:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -429,7 +434,8 @@ def parse_lease6(path: str, subnet_map: Optional[Dict[int, str]] = None) -> List
     return list(by_address.values())
 
 
-def _reservation_flags(reservation: Dict[str, Any]) -> Dict[str, Any]:
+def _reservation_flags(reservation: Dict[str, Any], subnet: Optional[str] = None,
+                       ipxe_scripts: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Per-host metadata for the reservation list: whether the host carries
     options, a boot source, or class assignments beyond its address.
 
@@ -438,7 +444,7 @@ def _reservation_flags(reservation: Dict[str, Any]) -> Dict[str, Any]:
     trustworthy without a separate query per page render.
     """
     if not isinstance(reservation, dict):
-        return {"options_count": 0, "boot_config": None, "classes": None}
+        return {"options_count": 0, "boot_config": None, "classes": None, "ipxe_script": None}
 
     options = reservation.get("option-data")
     options_count = len([o for o in options if isinstance(o, dict)]) if isinstance(options, list) else 0
@@ -447,10 +453,19 @@ def _reservation_flags(reservation: Dict[str, Any]) -> Dict[str, Any]:
     classes = reservation.get("client-classes")
     classes = [str(c) for c in classes] if isinstance(classes, list) else []
 
+    # The reservation itself does not reference its generated class (see
+    # core/ipxe.py), so the association is recomputed from the same (MAC,
+    # subnet) pair the class name is built from.
+    ipxe_script = None
+    if ipxe_scripts:
+        ipxe_script = ipxe_scripts.get(
+            ipxe.managed_class_name(reservation.get("hw-address"), subnet))
+
     return {
         "options_count": options_count,
         "boot_config": json.dumps(boot_props) if boot_props else None,
         "classes": json.dumps(classes) if classes else None,
+        "ipxe_script": ipxe_script,
     }
 
 
@@ -459,6 +474,8 @@ def parse_reservation4(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     subnets alike -- the same walk mac_reservations() does in routes/dhcp4.py."""
     rows: List[Dict[str, Any]] = []
     dhcp4 = config.get("Dhcp4", {})
+    # Built once per parse: generated class name -> the script it carries.
+    ipxe_scripts = ipxe.script_index(config, "Dhcp4")
     for subnet in dhcp4.get("subnet4", []):
         for reservation in subnet.get("reservations", []):
             rows.append({
@@ -467,7 +484,7 @@ def parse_reservation4(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "hostname": reservation.get("hostname"),
                 "subnet": subnet.get("subnet"),
                 "shared_network_name": None,
-                **_reservation_flags(reservation),
+                **_reservation_flags(reservation, subnet.get("subnet"), ipxe_scripts),
             })
     for network in dhcp4.get("shared-networks", []):
         name = network.get("name")
@@ -479,7 +496,7 @@ def parse_reservation4(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "hostname": reservation.get("hostname"),
                     "subnet": subnet.get("subnet"),
                     "shared_network_name": name,
-                    **_reservation_flags(reservation),
+                    **_reservation_flags(reservation, subnet.get("subnet"), ipxe_scripts),
                 })
     return rows
 
@@ -907,7 +924,7 @@ def search_reservation4(conn: sqlite3.Connection, *, q: Optional[str] = None, ma
     return _run_search(
         conn, "state_reservation4",
         ("mac_address", "ip_address", "hostname", "subnet", "shared_network_name",
-         "options_count", "boot_config", "classes"),
+         "options_count", "boot_config", "classes", "ipxe_script"),
         joins, where, params, sort_column, direction, limit, offset,
     )
 

@@ -122,13 +122,20 @@ q={{ search_query | urlencode }}&subnet={{ subnet | urlencode }}&sort={{ (sort o
               <span class="badge" style="background:rgba(139,92,246,.15);color:#a78bfa;"
                     title="Reserved into client class">{{ cls }}</span>
               {% endfor %}
+              {% if reservation.ipxe_script %}
+              <div style="font-size:.72rem;margin-bottom:.15rem;"
+                   title="Generated iPXE client class: this host is handed this script once iPXE is running">
+                <span class="badge" style="background:rgba(234,179,8,.15);color:#eab308;">iPXE</span>
+                <span style="font-family:monospace;word-break:break-all;">{{ reservation.ipxe_script }}</span>
+              </div>
+              {% endif %}
               {% if reservation.options_count %}
               <span class="badge badge-success"
                     title="{{ reservation.options_count }} option(s) set on this reservation only">
                 {{ reservation.options_count }} option{{ '' if reservation.options_count == 1 else 's' }}
               </span>
               {% endif %}
-              {% if not hboot and not hclasses and not reservation.options_count %}
+              {% if not hboot and not hclasses and not reservation.ipxe_script and not reservation.options_count %}
               <span class="text-secondary" style="font-size:.8rem;">&mdash;</span>
               {% endif %}
             </td>

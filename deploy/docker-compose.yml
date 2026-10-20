@@ -11,8 +11,8 @@
 #   cp kea.env.example kea.env        # then edit it, at minimum SECRET_KEY
 #
 #   # 2. build the image (see ../ezkea/Dockerfile for the arguments)
-#   docker build -t ez-kea:0.10.1 \
-#     --build-arg EZK_REF=v0.10.1 ../ezkea
+#   docker build -t ez-kea:0.10.2 \
+#     --build-arg EZK_REF=v0.10.2 ../ezkea
 #
 #   # 3. create the config the daemon loads (see docs/deployment.md, step 5)
 #   cp ../init/kea-dhcp4.conf /opt/ez-kea/kea/conf/kea-dhcp4.conf
@@ -27,7 +27,7 @@ name: ez-kea
 
 services:
   ezkea:
-    image: ez-kea:0.10.1
+    image: ez-kea:0.10.2
     container_name: ez-kea
     restart: unless-stopped
     depends_on:
@@ -70,8 +70,11 @@ services:
     volumes:
       # Kea's config directory. The file inside /etc/kea is the contract
       # between the two containers and EZ-KEA rewrites it in place, so the
-      # directory is what gets mounted, not the single file.
-      - ${KEA_ROOT:-/opt/ez-kea/kea}/conf:/etc/kea:ro
+      # directory is what gets mounted, not the single file -- read-write,
+      # because this container is the one that writes it (the daemon only
+      # reads it, which is why the kea service below mounts the same directory
+      # for its own use).
+      - ${KEA_ROOT:-/opt/ez-kea/kea}/conf:/etc/kea
       # The same directories the daemon has, so leases, its log and -- this
       # is the one that matters -- its control socket are visible here.
       - ${KEA_ROOT:-/opt/ez-kea/kea}/lib:/var/lib/kea:ro

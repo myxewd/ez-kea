@@ -13,7 +13,7 @@ from ..core.validation import (
     V4_BOOT_FIELDS, parse_scope_params, apply_scope_params, update_option_data,
     validate_option_data, _parse_option_rows,
 )
-from ..core import state_index
+from ..core import ipxe, state_index
 from ..core.instances import config_snapshot, ensure_leases
 from ..core.csv_export import stream_csv_response
 
@@ -96,6 +96,15 @@ def delete_shared_network() -> Response:
     config = load_json(current_app.config["DHCP_CONFIG_FILE"])
     
     if "Dhcp4" in config and "shared-networks" in config["Dhcp4"]:
+        for net in config["Dhcp4"]["shared-networks"]:
+            if net.get("name") != shared_network_name:
+                continue
+            # Every reservation in the network disappears with it, so the
+            # per-host iPXE classes those reservations own go too.
+            for subnet_obj in net.get("subnet4", []):
+                for reservation in subnet_obj.get("reservations", []):
+                    ipxe.remove_script(config, "Dhcp4", subnet_obj.get("subnet"),
+                                       reservation.get("hw-address"))
         config["Dhcp4"]["shared-networks"] = [
             net for net in config["Dhcp4"]["shared-networks"] if net.get("name") != shared_network_name
         ]
@@ -234,6 +243,14 @@ def delete_subnet() -> Response:
     subnet = request.form.get("subnet")
     config = load_json(current_app.config["DHCP_CONFIG_FILE"])
 
+    # Capture the subnet object before removing it: deleting a subnet drops its
+    # reservations, and their generated iPXE classes must not outlive them.
+    subnet_obj, _ = _find_subnet4(config, subnet)
+    if subnet_obj is not None:
+        for reservation in subnet_obj.get("reservations", []):
+            ipxe.remove_script(config, "Dhcp4", subnet_obj.get("subnet"),
+                               reservation.get("hw-address"))
+
     if shared_network_name:
         for network in config.get("Dhcp4", {}).get("shared-networks", []):
             if network.get("name") == shared_network_name:
@@ -369,6 +386,19 @@ _MAX_RESERVATION_OPTION_ROWS = 50
 def _parse_reservation_options(form: Any) -> Tuple[Dict[str, str], list, list]:
     """The reservation form's option rows (see validation._parse_option_rows)."""
     return _parse_option_rows(form, "res-option", _MAX_RESERVATION_OPTION_ROWS)
+
+
+def _ipxe_form_state(form: Any) -> Dict[str, Any]:
+    """The reservation form's iPXE quick-configuration fields.
+
+    "Boot with iPXE" + the address of this host's iPXE script is turned into a
+    client-class by core/ipxe.py. The state is rendered back verbatim after a
+    failed save, so a rejected form loses neither the checkbox nor the address.
+    """
+    return {
+        "enabled": form.get("boot-with-ipxe") == "on",
+        "script": (form.get("ipxe-script") or "").strip(),
+    }
 
 
 def _submitted_option_rows(form: Any) -> list:
@@ -517,7 +547,7 @@ def mac_reservations_export() -> Response:
 
     return stream_csv_response(
         ["mac_address", "ip_address", "hostname", "subnet", "shared_network_name",
-         "options_count", "boot_config", "classes"],
+         "options_count", "boot_config", "classes", "ipxe_script"],
         rows(),
         lambda row: [
             row["mac_address"] or "", row["ip_address"] or "", row["hostname"] or "",
@@ -525,6 +555,7 @@ def mac_reservations_export() -> Response:
             row.get("options_count") or 0,
             _describe_boot(row),
             ", ".join(json.loads(row["classes"])) if row.get("classes") else "",
+            row.get("ipxe_script") or "",
         ],
         "ez-kea-reservations4",
         state_index.EXPORT_MAX_ROWS,
@@ -550,6 +581,14 @@ def new_reservation() -> Union[str, Response, Tuple[str, int]]:
         # server or boot file without its own subnet.
         scope_params, scope_errors = parse_scope_params(request.form, V4_BOOT_FIELDS)
         errors.extend(scope_errors)
+
+        # Per-host iPXE script: the generated client-class supplies
+        # boot-file-name, so a reservation-level value would be a second,
+        # conflicting source for the same BOOTP header field.
+        ipxe_state = _ipxe_form_state(request.form)
+        errors.extend(ipxe.selection_errors(request.form))
+        if ipxe_state["enabled"]:
+            scope_params.pop("boot-file-name", None)
 
         reservation_options, option_rows, option_errors = _parse_reservation_options(request.form)
         errors.extend(option_errors)
@@ -577,6 +616,7 @@ def new_reservation() -> Union[str, Response, Tuple[str, int]]:
             return render_template(
                 "new_reservation.html", subnet_data=subnet_data, errors=errors,
                 scope_params=scope_params, option_rows=_submitted_option_rows(request.form),
+                ipxe=ipxe_state,
             ), 400
 
         # (kept: the submitted rows are re-rendered so a rejected save loses
@@ -589,8 +629,13 @@ def new_reservation() -> Union[str, Response, Tuple[str, int]]:
         apply_scope_params(reservation, scope_params, V4_BOOT_FIELDS)
         update_option_data(reservation, reservation_options, row_order=option_rows)
         subnet_obj.setdefault("reservations", []).append(reservation)
+        if ipxe_state["enabled"]:
+            ipxe.apply_script(config, "Dhcp4", subnet, mac_address, ipxe_state["script"])
 
         save_kea_config(config, current_app.config["DHCP_CONFIG_FILE"], current_app.config["BACKUP_DIR"])
+        if ipxe_state["enabled"]:
+            flash("iPXE client class generated for this host. Apply Changes to make "
+                  "the daemon use it.", "info")
         # Unlike logs/leases, EZ-KEA itself just wrote this reservation --
         # without an immediate reindex it wouldn't show up in a search until
         # the next background pass, which would look like the save failed.
@@ -598,7 +643,8 @@ def new_reservation() -> Union[str, Response, Tuple[str, int]]:
         return redirect(url_for("main.dhcp4.mac_reservations"))
 
     return render_template("new_reservation.html", subnet_data=subnet_data, errors=errors,
-                           option_rows=[("", "", False)] * _RESERVATION_BLANK_OPTION_ROWS)
+                           option_rows=[("", "", False)] * _RESERVATION_BLANK_OPTION_ROWS,
+                           ipxe={"enabled": False, "script": ""})
 
 @dhcp4_bp.route("/delete-reservation", methods=["POST"])
 @login_required
@@ -617,15 +663,21 @@ def delete_reservation() -> Response:
         subnet_obj, reservation = _find_reservation4(config, hw_address, subnet)
         if subnet_obj and reservation:
             subnet_obj["reservations"].remove(reservation)
+            # The class exists only for this reservation; leaving it behind
+            # would hand this MAC its old iPXE script with nothing to edit.
+            ipxe.remove_script(config, "Dhcp4", subnet, hw_address)
     elif shared_network_name:
         # Legacy fallback for callers that only supply a shared-network name.
         for network in config.get("Dhcp4", {}).get("shared-networks", []):
             if network.get("name") == shared_network_name:
                 for subnet_obj in network.get("subnet4", []):
                     if "reservations" in subnet_obj:
+                        before = len(subnet_obj["reservations"])
                         subnet_obj["reservations"] = [
                             res for res in subnet_obj["reservations"] if res.get("hw-address") != hw_address
                         ]
+                        if len(subnet_obj["reservations"]) != before:
+                            ipxe.remove_script(config, "Dhcp4", subnet_obj.get("subnet"), hw_address)
                 break
 
     save_kea_config(config, current_app.config["DHCP_CONFIG_FILE"], current_app.config["BACKUP_DIR"])
@@ -658,11 +710,13 @@ def edit_reservation() -> Union[str, Response, Tuple[str, int]]:
         if current_ip and current_ip not in subnet_data.get(subnet, []):
             subnet_data.setdefault(subnet, []).insert(0, current_ip)
 
+        existing_script = ipxe.script_for(config, "Dhcp4", subnet, hw_address)
         return render_template(
             "new_reservation.html", subnet_data=subnet_data, errors=errors,
             editing=True, subnet=subnet, reservation=reservation,
             scope_params={name: reservation.get(name, "") for name in V4_BOOT_FIELDS},
             option_rows=_reservation_option_rows(reservation),
+            ipxe={"enabled": bool(existing_script), "script": existing_script},
         )
 
     # POST
@@ -684,6 +738,11 @@ def edit_reservation() -> Union[str, Response, Tuple[str, int]]:
 
     scope_params, scope_errors = parse_scope_params(request.form, V4_BOOT_FIELDS)
     errors.extend(scope_errors)
+
+    ipxe_state = _ipxe_form_state(request.form)
+    errors.extend(ipxe.selection_errors(request.form))
+    if ipxe_state["enabled"]:
+        scope_params.pop("boot-file-name", None)
 
     reservation_options, option_rows, option_errors = _parse_reservation_options(request.form)
     errors.extend(option_errors)
@@ -708,6 +767,7 @@ def edit_reservation() -> Union[str, Response, Tuple[str, int]]:
             "new_reservation.html", subnet_data=subnet_data, errors=errors,
             editing=True, subnet=subnet, reservation=fallback_reservation,
             scope_params=scope_params, option_rows=_submitted_option_rows(request.form),
+            ipxe=ipxe_state,
         ), 400
 
     reservation.update({
@@ -720,7 +780,24 @@ def edit_reservation() -> Union[str, Response, Tuple[str, int]]:
     # touched, and only the rows the operator explicitly deleted are dropped.
     update_option_data(reservation, reservation_options, row_order=option_rows)
 
+    # The generated class is named after the reservation's MAC, so a MAC edit is
+    # a move: write the class for the new MAC first, then drop the old one. The
+    # comparison is on the generated names, not the raw strings -- "52-54-..."
+    # and "52:54:..." are the same host, and removing the "old" class after
+    # applying the new one would delete the class just written.
+    old_class_name = ipxe.managed_class_name(original_hw_address, subnet)
+    new_class_name = ipxe.managed_class_name(mac_address, subnet)
+    if ipxe_state["enabled"]:
+        ipxe.apply_script(config, "Dhcp4", subnet, mac_address, ipxe_state["script"])
+    else:
+        ipxe.remove_script(config, "Dhcp4", subnet, mac_address)
+    if old_class_name and old_class_name != new_class_name:
+        ipxe.remove_script(config, "Dhcp4", subnet, original_hw_address)
+
     save_kea_config(config, current_app.config["DHCP_CONFIG_FILE"], current_app.config["BACKUP_DIR"])
+    if ipxe_state["enabled"]:
+        flash("iPXE client class updated for this host. Apply Changes to make the "
+              "daemon use it.", "info")
     state_index.reindex_now(current_app, kinds=["reservation4"])
     return redirect(url_for("main.dhcp4.mac_reservations"))
 

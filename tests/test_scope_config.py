@@ -820,7 +820,18 @@ def test_reservation_metadata_flags(app):
     assert "next-server" in flags["boot_config"]
     assert "c1" in flags["classes"]
     assert state_index._reservation_flags({}) == {
-        "options_count": 0, "boot_config": None, "classes": None}
+        "options_count": 0, "boot_config": None, "classes": None, "ipxe_script": None}
+
+    # The generated iPXE class is not referenced by the reservation, so the
+    # flag is resolved from the (MAC, subnet) pair the class name is built from.
+    config = {"Dhcp4": {"subnet4": [{"subnet": "10.0.0.0/24", "reservations": []}]}}
+    from ez_kea.core import ipxe
+    ipxe.apply_script(config, "Dhcp4", "10.0.0.0/24", "aa:bb:cc:dd:ee:ff",
+                      "http://boot.example.com/host.ipxe")
+    flags = state_index._reservation_flags(
+        {"hw-address": "aa:bb:cc:dd:ee:ff", "ip-address": "10.0.0.10"},
+        "10.0.0.0/24", ipxe.script_index(config, "Dhcp4"))
+    assert flags["ipxe_script"] == "http://boot.example.com/host.ipxe"
 
 
 # ── Removing an option (the bug: a cleared row used to mean "do nothing") ───

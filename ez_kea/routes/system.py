@@ -337,6 +337,35 @@ def _pool_groups(config: Dict[str, Any], dhcp_key: str, subnet_key: str, lease_c
     return groups
 
 
+@system_bp.route("/healthz")
+def healthz() -> Union[Response, Tuple[Response, int]]:
+    """Unauthenticated readiness probe for the container healthcheck.
+
+    Answers only the two questions that make every page fail at once: the
+    database can be reached, and the Kea config EZ-KEA manages can be read and
+    parsed. Deliberately cheap -- it does not touch the daemon's control
+    channel (that is /api/daemon-status, which is authenticated and can be
+    slow or unreachable without meaning this process is broken).
+    """
+    from sqlalchemy import text
+    from .. import db
+
+    problems: List[str] = []
+    try:
+        with db.engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception:
+        problems.append("database")
+    try:
+        load_json(current_app.config["DHCP_CONFIG_FILE"])
+    except Exception:
+        problems.append("config")
+
+    if problems:
+        return jsonify({"status": "error", "problems": problems}), 503
+    return jsonify({"status": "ok"})
+
+
 @system_bp.route("/")
 @login_required
 def index() -> str:

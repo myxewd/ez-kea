@@ -1042,6 +1042,24 @@ def test_index_renders_dashboard_stats(dashboard_client):
     assert "daemon-status-6" not in body
 
 
+def test_healthz_is_ok_without_login(dashboard_app):
+    """The container healthcheck hits /healthz unauthenticated; it must answer
+    whether the database and the managed config are usable, not redirect to a
+    login page."""
+    response = dashboard_app.test_client().get("/healthz")
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "ok"}
+
+
+def test_healthz_reports_a_config_it_cannot_read(dashboard_app):
+    with open(dashboard_app.config["DHCP_CONFIG_FILE"], "w") as handle:
+        handle.write("{ not json")
+
+    response = dashboard_app.test_client().get("/healthz")
+    assert response.status_code == 503
+    assert "config" in response.get_json()["problems"]
+
+
 def test_index_shows_live_daemon_check_when_not_demo_mode(dashboard_client, dashboard_app):
     """A LIVE-mode install (real Kea config found for that version) must get
     the async daemon-status badge + client-side fetch, not the demo one."""

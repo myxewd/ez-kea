@@ -16,6 +16,7 @@ from flask_login import login_required
 from werkzeug.wrappers import Response
 
 from ..core import client_class as cc
+from ..core import ipxe
 from ..core.config_manager import _DEFAULT_KEA6_CONFIG, load_json, save_kea_config, with_config_lock
 from ..core.config_validate import InvalidConfigError, save_validated_kea_config
 from ..core.instances import config_snapshot
@@ -44,10 +45,22 @@ def _context(version: str) -> Dict[str, Any]:
     daemon = _daemon(version)
     config = load_json(current_app.config[daemon["config_key"]], default=daemon["default"])
     entries = cc.get_client_classes(config, daemon["root_key"])
+    # A generated class is shown as managed and linked to the reservation that
+    # owns it, instead of offering the ordinary edit/delete actions. The owner
+    # is read from the config (not decoded from the name) so the link carries
+    # the real subnet string; a managed name with no owner is orphaned.
+    owners = ipxe.owners(config, daemon["root_key"]) if version == "4" else {}
+    classes = []
+    for entry in entries:
+        summary = cc.class_summary(entry)
+        name = summary.get("name", "")
+        summary["managed"] = ipxe.is_managed_name(name)
+        summary["owner"] = owners.get(name) if summary["managed"] else None
+        classes.append(summary)
     return {
         "version": version,
         "dhcp_label": daemon["label"],
-        "classes": [cc.class_summary(e) for e in entries],
+        "classes": classes,
         "class_count": len(entries),
         "max_option_rows": cc.MAX_CLASS_OPTION_ROWS,
         "blank_option_rows": cc.CLASS_OPTION_BLANK_ROWS,
@@ -81,6 +94,41 @@ def _form_context(version: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         # Live rows only; a class with none gets blank ones (see above).
         "option_rows": rows,
     }
+
+
+def _managed_owner(config: Dict[str, Any], daemon: Dict[str, Any], name: str) -> Dict[str, str]:
+    """The reservation that owns a generated class, or {} when it is orphaned."""
+    return ipxe.owners(config, daemon["root_key"]).get(name) or {}
+
+
+def _managed_message(name: str, owner: Dict[str, str], action: str) -> str:
+    """One sentence explaining why a managed class cannot be changed here,
+    naming the reservation to change instead."""
+    if owner:
+        label = owner.get("hostname") or owner.get("hw-address") or "a host"
+        return (
+            f"Client class '{name}' is generated from the reservation for {label} "
+            f"in {owner.get('subnet')} and cannot be {action} directly. "
+            "Change the reservation's iPXE settings instead."
+        )
+    return (
+        f"Client class '{name}' is managed by EZ-KEA and has no reservation left "
+        f"to change it from, so it cannot be {action} here."
+    )
+
+
+def _managed_redirect(version: str, name: str, config: Dict[str, Any],
+                      daemon: Dict[str, Any]) -> Response:
+    """Send the operator to the reservation that owns a managed class."""
+    owner = _managed_owner(config, daemon, name)
+    if version == "4" and owner:
+        flash(_managed_message(name, owner, "edited"), "warning")
+        return redirect(url_for(
+            "main.dhcp4.edit_reservation",
+            **{"hw-address": owner["hw-address"], "subnet": owner["subnet"]},
+        ))
+    flash(_managed_message(name, owner, "edited"), "warning")
+    return redirect(url_for("main.client_classes.client_classes_version", version=version))
 
 
 @client_classes_bp.route("/client-classes")
@@ -137,6 +185,10 @@ def edit_client_class_version(version: str) -> Union[str, Response, Tuple[str, i
     if entry is None:
         flash(f"Client class '{name}' was not found.", "danger")
         return redirect(url_for("main.client_classes.client_classes_version", version=version))
+    if ipxe.is_managed_name(name):
+        # The class is generated from a reservation's iPXE settings; editing it
+        # here would silently diverge from the reservation.
+        return _managed_redirect(version, name, config, daemon)
 
     return render_template("new_client_class.html", editing=True, errors=[],
                            original_name=name, **_form_context(version, entry))
@@ -169,12 +221,6 @@ def _save(version: str) -> Union[Response, Tuple[str, int]]:
     config = load_json(config_file, default=daemon["default"])
     existing_names = {c.get("name") for c in cc.get_client_classes(config, root_key)}
 
-    entry, errors = cc.parse_class_form(
-        request.form, version,
-        original=original,
-        existing_names=existing_names - {original} if original else existing_names,
-    )
-
     # What the operator typed, so neither a validation error nor Kea rejecting
     # the config loses it. Built before either check runs.
     submitted: Dict[str, Any] = {
@@ -194,6 +240,21 @@ def _save(version: str) -> Union[Response, Tuple[str, int]]:
         if row_name or row_data:
             submitted_rows.append({"name": row_name, "data": row_data})
     submitted["option-data"] = submitted_rows
+
+    # Renaming out of the managed namespace, or into it, is refused for the
+    # same reason as an edit: the name is the binding to the reservation.
+    if ipxe.is_managed_name(original):
+        return render_template(
+            "new_client_class.html", editing=True,
+            errors=[_managed_message(original, _managed_owner(config, daemon, original), "edited")],
+            original_name=original, **_form_context(version, submitted),
+        ), 400
+
+    entry, errors = cc.parse_class_form(
+        request.form, version,
+        original=original,
+        existing_names=existing_names - {original} if original else existing_names,
+    )
 
     if errors:
         return render_template(
@@ -262,6 +323,21 @@ def _delete(version: str) -> Response:
     name = (request.form.get("name") or "").strip()
     config_file = current_app.config[daemon["config_key"]]
     config = load_json(config_file, default=daemon["default"])
+
+    if ipxe.is_managed_name(name):
+        owner = _managed_owner(config, daemon, name)
+        if owner:
+            flash(_managed_message(name, owner, "deleted"), "danger")
+        elif cc.remove_client_class(config, daemon["root_key"], name):
+            # Orphaned: the reservation it was generated for is gone (usually a
+            # hand edit of the raw config), so deleting the leftover is cleanup
+            # rather than overriding a live binding.
+            save_kea_config(config, config_file, current_app.config["BACKUP_DIR"])
+            flash(f"Orphaned client class '{name}' deleted. "
+                  "Apply Changes to make the daemon use it.", "info")
+        else:
+            flash(f"Client class '{name}' was not found.", "danger")
+        return redirect(url_for("main.client_classes.client_classes_version", version=version))
 
     if name and cc.remove_client_class(config, daemon["root_key"], name):
         save_kea_config(config, config_file, current_app.config["BACKUP_DIR"])
