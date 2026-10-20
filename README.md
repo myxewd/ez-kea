@@ -232,7 +232,7 @@ In short:
 - **More than one deployment?** ISPs, MSPs, enterprises, and multi-site operators get volume licensing, priced on how many you run rather than off a list price. Email **<sales@ezkea.com>** with the number and I will quote it.
 - **Want to try it at work first?** Free 30 day commercial eval, no questions asked. Email **<sales@ezkea.com>** and I will send you a trial key.
 
-Unlicensed installs show a small note in the footer. It never blocks, degrades, or expires. It will not lock you out of your own config, licensed or not.
+Nothing is gated on the license: no feature flags, no lease ceiling, no expiry. An unlicensed install larger than a homelab shows a banner above the page suggesting you get one, and that is the whole of it. It will not lock you out of your own config, licensed or not.
 
 The [LICENSE](LICENSE) file is what counts, this is just a summary. More detail in [Licensing](https://github.com/fenleytech/ez-kea/wiki/Licensing).
 

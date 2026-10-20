@@ -54,17 +54,11 @@ _public_key = serialization.load_pem_public_key(_PUBLIC_KEY_PEM)
 
 LICENSE_PREFIX = "EZK1."
 
-# Above this many active leases, the quiet unlicensed footer note is escalated
-# to a visible banner. This is a heuristic for "this install is probably not
+# Above this many active leases, an unlicensed install gets a visible banner
+# above the page content. This is a heuristic for "this install is probably not
 # somebody's homelab", used only to decide how loudly to mention licensing.
 # Nothing is gated on it, so its exact value costs nobody anything.
 NAG_LEASE_THRESHOLD = 100
-
-_UNLICENSED_NOTICE = (
-    "Unlicensed — free for personal and other noncommercial use. "
-    "Commercial use requires a license: $500/year per deployment, "
-    "sales@ezkea.com."
-)
 
 
 def parse_license(key_str: str) -> dict:
@@ -151,12 +145,13 @@ def license_status(active_lease_count: int = 0) -> dict:
 
     Args:
         active_lease_count: Number of currently active DHCP leases. Only used
-            to decide whether to escalate the quiet note to a banner.
+            to decide whether to show a banner.
 
     Returns:
         dict with keys:
           licensed (bool): a valid commercial license is installed.
-          notice (str):    quiet footer text, "" when licensed.
+          notice (str):    always "" — kept so callers and templates that read
+                           it keep working without a coordinated change.
           banner (str):    prominent banner text, "" when licensed or when the
                            install is small enough not to warrant one.
     """
@@ -171,4 +166,4 @@ def license_status(active_lease_count: int = 0) -> dict:
             "license — $500 per year for a single deployment."
         )
 
-    return {"licensed": False, "notice": _UNLICENSED_NOTICE, "banner": banner}
+    return {"licensed": False, "notice": "", "banner": banner}

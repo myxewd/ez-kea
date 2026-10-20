@@ -173,25 +173,14 @@
         {% block content %}{% endblock %}
     </main>
 
-    {# The footer used to exist only when there was a licensing notice to show,
-       which meant the version was invisible on exactly the licensed installs
-       whose owners are most likely to be filing a support ticket. It now
-       renders whenever there is either a notice or a signed-in user. The
+    {# The footer carries the version for signed-in users so a support ticket
+       can name the exact build. The unlicensed reminder that used to live here
+       was removed — the Licensing page still states the commercial terms. The
        version is deliberately withheld from the logged-out login page — the
        people who need it are already inside. #}
-    {% if (license_state and license_state.notice) or current_user.is_authenticated %}
+    {% if current_user.is_authenticated %}
     <footer style="max-width:1200px;margin:2rem auto 1rem;padding:0 1.5rem;font-size:0.8rem;opacity:0.55;text-align:center;">
-      {% if license_state and license_state.notice %}
-      <div>
-        {{ license_state.notice }}
-        {% if current_user.is_authenticated and current_user.is_admin %}
-        <a href="{{ url_for('auth.license_page') }}" style="color:inherit;">Details</a>
-        {% endif %}
-      </div>
-      {% endif %}
-      {% if current_user.is_authenticated %}
-      <div style="margin-top:0.35rem;">EZ-KEA v{{ ez_kea_version }}</div>
-      {% endif %}
+      <div>EZ-KEA v{{ ez_kea_version }}</div>
     </footer>
     {% endif %}
 

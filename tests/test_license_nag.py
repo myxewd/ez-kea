@@ -89,11 +89,12 @@ def test_get_requests_work_over_threshold(app, client):
 
 # ── The reminder itself ─────────────────────────────────────────────────────
 
-def test_unlicensed_small_install_gets_notice_but_no_banner(app):
+def test_unlicensed_small_install_gets_no_nag(app):
+    """The footer reminder is gone: a small unlicensed install is silent."""
     with app.app_context():
         state = license_status(12)
     assert state["licensed"] is False
-    assert "noncommercial" in state["notice"]
+    assert state["notice"] == ""
     assert state["banner"] == ""
 
 
@@ -101,7 +102,6 @@ def test_unlicensed_large_install_gets_banner(app):
     with app.app_context():
         state = license_status(NAG_LEASE_THRESHOLD + 1)
     assert state["licensed"] is False
-    assert state["notice"]
     assert str(NAG_LEASE_THRESHOLD + 1) in state["banner"]
     assert "commercial use requires a license" in state["banner"].lower()
 
@@ -115,10 +115,18 @@ def test_licensed_install_is_never_nagged(app, monkeypatch):
 
 # ── Rendering ───────────────────────────────────────────────────────────────
 
-def test_footer_notice_rendered_when_unlicensed(app, client):
+def test_footer_notice_gone_when_unlicensed(app, client):
+    """The removed footer note must not come back from the context processor."""
     _write_leases(app.config["DHCP_LEASES_FILE"], 10)
     body = client.get("/pools").get_data(as_text=True)
-    assert "Commercial use requires a license" in body
+    assert "Commercial use requires a license" not in body
+    assert "Unlicensed" not in body
+
+
+def test_footer_still_carries_version_when_unlicensed(app, client):
+    """Only the notice went; the version line is still rendered."""
+    body = client.get("/pools").get_data(as_text=True)
+    assert "EZ-KEA v" in body
 
 
 def test_banner_rendered_over_threshold(app, client):
