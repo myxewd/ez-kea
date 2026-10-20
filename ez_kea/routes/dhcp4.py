@@ -14,6 +14,7 @@ from ..core.validation import (
     validate_option_data, _parse_option_rows,
 )
 from ..core import state_index
+from ..core.instances import config_snapshot, ensure_leases
 from ..core.csv_export import stream_csv_response
 
 dhcp4_bp = Blueprint('dhcp4', __name__)
@@ -448,7 +449,7 @@ def mac_reservations() -> str:
         # changed), so refreshing inline here guarantees the page always
         # reflects the config as it is right now rather than being stale by
         # up to STATE_INDEX_INTERVAL seconds.
-        state_index.ingest_all(dict(current_app.config), conn, kinds=["reservation4"])
+        state_index.ingest_all(config_snapshot(current_app.config), conn, kinds=["reservation4"])
         result = state_index.search_reservation4(
             conn, q=q or None, subnet=subnet or None,
             sort=sort, direction=direction,
@@ -489,7 +490,7 @@ def mac_reservations_export() -> Response:
     q = (request.values.get("q") or "").strip() or None
     subnet = (request.values.get("subnet") or "").strip() or None
     _, sort, direction = _pagination_params()
-    app_config = dict(current_app.config)
+    app_config = config_snapshot(current_app.config)
 
     def rows():
         conn = state_index.connect(app_config["STATE_INDEX_DB"])
@@ -735,6 +736,12 @@ def leases() -> str:
     """
     from ..core.validation import unix_to_human_readable
 
+    # A remote endpoint's table is pulled on demand (lease4-get-all), so the
+    # page shows the daemon's leases rather than an empty local file. The
+    # freshness window keeps this off the critical path on repeat views.
+    for warning in ensure_leases("4"):
+        flash(warning, "warning")
+
     q = (request.values.get("q") or "").strip()
     status = (request.values.get("status") or "").strip() or None
     subnet = (request.values.get("subnet") or "").strip() or None
@@ -748,7 +755,7 @@ def leases() -> str:
 
     conn = state_index.connect(current_app.config["STATE_INDEX_DB"])
     try:
-        state_index.ingest_all(dict(current_app.config), conn, kinds=["lease4"])
+        state_index.ingest_all(config_snapshot(current_app.config), conn, kinds=["lease4"])
         result = state_index.search_lease4(
             conn, q=q or None, status=status, subnet=subnet, start=start, end=end,
             sort=sort, direction=direction,
@@ -794,7 +801,7 @@ def leases_export() -> Response:
         request.values.get("range", ""), request.values.get("start", ""), request.values.get("end", "")
     )
     _, sort, direction = _pagination_params()
-    app_config = dict(current_app.config)
+    app_config = config_snapshot(current_app.config)
 
     def rows():
         conn = state_index.connect(app_config["STATE_INDEX_DB"])

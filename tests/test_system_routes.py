@@ -294,6 +294,216 @@ def test_config_reload_is_allowlisted_but_arbitrary_commands_are_not():
     for forbidden in ("config-set", "shutdown", "lease4-wipe", "config-write"):
         assert forbidden not in ALLOWED_COMMANDS
 
+# ── HTTP API reload strategy: config-test first, then config-set ───────────
+
+def _use_http_strategy(app, tmp_path, dhcp_key="Dhcp4", version="4", url=""):
+    """Point the app at a real config file exposing an http control socket and
+    select the http strategy."""
+    config_file = tmp_path / ("kea-dhcp%s.conf" % version)
+    config_file.write_text(json.dumps({dhcp_key: {
+        "valid-lifetime": 4000,
+        "control-sockets": [
+            {"socket-type": "http", "socket-address": "127.0.0.1", "socket-port": 8000},
+        ],
+    }}))
+    app.config["DHCP6_CONFIG_FILE" if version == "6" else "DHCP_CONFIG_FILE"] = str(config_file)
+    app.config["KEA_RELOAD_STRATEGY"] = "http"
+    app.config["KEA_HTTP_URL6" if version == "6" else "KEA_HTTP_URL"] = url
+    return config_file
+
+
+@patch('subprocess.run')
+def test_apply_config_http_pushes_the_on_disk_document(mock_run, client, app, tmp_path):
+    """The http strategy applies by asking the daemon itself: config-test on the
+    document EZ-KEA just wrote, then config-set. No reload, no signal, no
+    binary beyond the ordinary -t check."""
+    mock_run.return_value.returncode = 0
+    config_file = _use_http_strategy(app, tmp_path)
+
+    with patch('ez_kea.routes.system.push_config',
+               return_value={"result": 0, "text": "Configuration successful.",
+                             "arguments": {"hash": "0123456789abcdef"}}) as push:
+        response = client.post("/apply-config")
+
+    assert response.status_code == 200
+    assert "config-test, then config-set" in response.json["message"]
+    assert "0123456789ab" in response.json["message"]
+
+    endpoint, dhcp_key, document = push.call_args[0]
+    assert endpoint == "http://127.0.0.1:8000/"
+    assert dhcp_key == "Dhcp4"
+    # Exactly the file that was written, wrapped the way Kea expects.
+    assert document["Dhcp4"] == json.loads(config_file.read_text())["Dhcp4"]
+    # Only the syntax check shelled out.
+    mock_run.assert_called_once()
+
+
+@patch('subprocess.run')
+def test_apply_config_http_refused_test_applies_nothing(mock_run, client, app, tmp_path):
+    """A refused config-test must stop the apply: the daemon never sees a
+    config-set, and the operator is told nothing was applied."""
+    from ez_kea.core.kea_ctrl import ConfigRejectedError
+    mock_run.return_value.returncode = 0
+    _use_http_strategy(app, tmp_path)
+
+    with patch('ez_kea.routes.system.push_config',
+               side_effect=ConfigRejectedError("config-test", "unsupported parameter: BOGUS")):
+        response = client.post("/apply-config")
+
+    assert response.status_code == 500
+    error = response.json["error"]
+    assert "config-test" in error
+    assert "BOGUS" in error
+    assert "previous configuration" in error
+
+
+@patch('subprocess.run')
+def test_apply_config_http_distinguishes_a_config_set_refusal(mock_run, client, app, tmp_path):
+    from ez_kea.core.kea_ctrl import ConfigRejectedError
+    mock_run.return_value.returncode = 0
+    _use_http_strategy(app, tmp_path)
+
+    with patch('ez_kea.routes.system.push_config',
+               side_effect=ConfigRejectedError("config-set", "failed to open lease database")):
+        response = client.post("/apply-config")
+
+    assert response.status_code == 500
+    error = response.json["error"]
+    assert "config-set" in error
+    assert "lease database" in error
+
+
+@patch('subprocess.run')
+def test_apply_config_http_transport_failure_is_reported(mock_run, client, app, tmp_path):
+    from ez_kea.core.kea_ctrl import ControlChannelError
+    mock_run.return_value.returncode = 0
+    _use_http_strategy(app, tmp_path)
+
+    with patch('ez_kea.routes.system.push_config',
+               side_effect=ControlChannelError("Could not reach Kea's HTTP control channel")):
+        response = client.post("/apply-config")
+
+    assert response.status_code == 500
+    assert "HTTP API" in response.json["error"]
+
+
+@patch('subprocess.run')
+def test_apply_config_http_requires_an_http_socket(mock_run, client, app, tmp_path):
+    """Selecting the strategy against a daemon that only has a UNIX socket must
+    fail loudly rather than silently doing nothing."""
+    mock_run.return_value.returncode = 0
+    config_file = tmp_path / "kea-dhcp4.conf"
+    config_file.write_text(json.dumps({"Dhcp4": {"control-sockets": [
+        {"socket-type": "unix", "socket-name": "/var/run/kea/kea-dhcp4-ctrl.sock"},
+    ]}}))
+    app.config["DHCP_CONFIG_FILE"] = str(config_file)
+    app.config["KEA_RELOAD_STRATEGY"] = "http"
+    app.config["KEA_HTTP_URL"] = ""
+
+    response = client.post("/apply-config")
+
+    assert response.status_code == 500
+    assert "no http or https control socket" in response.json["error"]
+
+
+@patch('subprocess.run')
+def test_apply_config_http_url_override_wins(mock_run, client, app, tmp_path):
+    """KEA_HTTP_URL is how a listener the config file does not describe (another
+    host, a published container port) is reached."""
+    mock_run.return_value.returncode = 0
+    config_file = tmp_path / "kea-dhcp4.conf"
+    config_file.write_text(json.dumps({"Dhcp4": {"valid-lifetime": 4000}}))
+    app.config["DHCP_CONFIG_FILE"] = str(config_file)
+    app.config["KEA_RELOAD_STRATEGY"] = "http"
+    app.config["KEA_HTTP_URL"] = "kea.lan:9000"
+
+    with patch('ez_kea.routes.system.push_config', return_value={"result": 0}) as push:
+        response = client.post("/apply-config")
+
+    assert response.status_code == 200
+    assert push.call_args[0][0] == "http://kea.lan:9000/"
+
+
+@patch('subprocess.run')
+def test_apply_config_http_rejects_an_unusable_url_override(mock_run, client, app, tmp_path):
+    mock_run.return_value.returncode = 0
+    _use_http_strategy(app, tmp_path, url="ftp://kea.lan")
+
+    response = client.post("/apply-config")
+
+    assert response.status_code == 500
+    assert "misconfigured" in response.json["error"]
+    assert "ftp" in response.json["error"]
+
+
+@patch('subprocess.run')
+def test_apply_config_http_passes_credentials_from_the_environment(mock_run, client, app, tmp_path):
+    """Kea 3.x refuses an unauthenticated HTTP channel, so the credential EZ-KEA
+    sends is what makes the strategy usable at all."""
+    mock_run.return_value.returncode = 0
+    _use_http_strategy(app, tmp_path)
+    app.config["KEA_HTTP_USER"] = "admin"
+    app.config["KEA_HTTP_PASSWORD"] = "s3cret"
+
+    with patch('ez_kea.routes.system.push_config', return_value={"result": 0}) as push:
+        response = client.post("/apply-config")
+
+    assert response.status_code == 200
+    assert push.call_args[1]["auth"] == ("admin", "s3cret")
+
+
+@patch('subprocess.run')
+def test_apply_config_http_rejects_half_a_credential(mock_run, client, app, tmp_path):
+    """Half a credential can only produce a 401, so say so before connecting."""
+    mock_run.return_value.returncode = 0
+    _use_http_strategy(app, tmp_path)
+    app.config["KEA_HTTP_USER"] = "admin"
+    app.config["KEA_HTTP_PASSWORD"] = ""
+
+    response = client.post("/apply-config")
+
+    assert response.status_code == 500
+    assert "KEA_HTTP_USER and KEA_HTTP_PASSWORD" in response.json["error"]
+
+
+@patch('subprocess.run')
+def test_apply_config_http_works_for_dhcp6(mock_run, client, app, tmp_path):
+    mock_run.return_value.returncode = 0
+    _use_http_strategy(app, tmp_path, dhcp_key="Dhcp6", version="6")
+
+    with patch('ez_kea.routes.system.push_config', return_value={"result": 0}) as push:
+        response = client.post("/apply-config/6")
+
+    assert response.status_code == 200
+    assert push.call_args[0][1] == "Dhcp6"
+    assert "Dhcp6" in push.call_args[0][2]
+
+
+# ── daemon status over the HTTP channel ────────────────────────────────────
+
+def test_daemon_status_uses_http_when_that_is_the_only_channel(client, app, tmp_path):
+    """An HTTP-only daemon is reachable, not "not configured"."""
+    _use_http_strategy(app, tmp_path)
+
+    with patch('ez_kea.core.kea_ctrl.send_http_command',
+               return_value={"result": 0, "text": ""}) as http_command:
+        response = client.get("/api/daemon-status/4")
+
+    assert response.json["status"] == "running"
+    assert http_command.call_args[0][1] == "status-get"
+
+
+def test_daemon_status_reports_not_configured_without_any_channel(client, app, tmp_path):
+    config_file = tmp_path / "kea-dhcp4.conf"
+    config_file.write_text(json.dumps({"Dhcp4": {"valid-lifetime": 4000}}))
+    app.config["DHCP_CONFIG_FILE"] = str(config_file)
+    app.config["KEA_HTTP_URL"] = ""
+
+    response = client.get("/api/daemon-status/4")
+
+    assert response.json["status"] == "not_configured"
+
+
 
 @patch('subprocess.run')
 def test_apply_config_reload_failure(mock_subprocess_run, client):
@@ -980,6 +1190,84 @@ def test_pool_groups_unnamed_shared_network_gets_a_fallback_label():
     config = {"Dhcp4": {"shared-networks": [{"subnet4": []}]}}
     groups = _pool_groups(config, "Dhcp4", "subnet4", {})
     assert groups[0]["name"] == "Unnamed shared network"
+
+
+# -- KEA_HTTP_URL: the http strategy's endpoint is a saved setting --------------
+
+def test_app_settings_page_offers_the_http_strategy(global_settings_client):
+    """The new strategy has to be selectable, with its own endpoint field.
+
+    Uses the create_app-backed fixture because it is the one wired with the
+    real template folder (the bare Flask app in full_app has none).
+    """
+    response = global_settings_client.get("/app-settings")
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert 'value="http"' in body
+    assert 'name="dhcp-http-url"' in body
+    assert "config-test" in body
+
+
+def test_save_app_settings_persists_the_http_url(full_app, full_client):
+    """The http strategy's endpoint is an app setting, not an env-only knob --
+    it has to survive a restart like every other field on that page."""
+    response = full_client.post("/save-app-settings", data={
+        "kea-reload-strategy": "http",
+        "dhcp-http-url": "127.0.0.1:8000",
+    })
+    assert response.status_code == 302
+
+    with open(full_app.config["SETTINGS_FILE"]) as f:
+        settings = json.load(f)
+    assert settings["kea_reload_strategy"] == "http"
+    # Stored canonicalised, so the field round-trips as what will be connected to.
+    assert settings["dhcp_http_url"] == "http://127.0.0.1:8000/"
+    assert full_app.config["KEA_HTTP_URL"] == "http://127.0.0.1:8000/"
+
+
+def test_save_app_settings_keeps_the_two_http_urls_apart(full_app, full_client, tmp_path):
+    """Each daemon listens on its own address/port, so the override is per
+    version -- a single shared value could only ever apply to one of them."""
+    v6_config = tmp_path / "kea-dhcp6.conf"
+    v6_config.write_text('{"Dhcp6": {"shared-networks": []}}')
+    full_app.config["DHCP6_CONFIG_FILE"] = str(v6_config)
+    full_app.config["DHCP6_LEASES_FILE"] = str(tmp_path / "kea-leases6.csv")
+    full_app.config["DHCP6_LOG_FILE"] = str(tmp_path / "kea-dhcp6.log")
+    full_app.config["KEA_DHCP6_CMD"] = "/nonexistent/kea-dhcp6-not-installed"
+
+    full_client.post("/save-app-settings", data={"dhcp-http-url": "http://10.0.0.1:8000"})
+    full_client.post("/save-app-settings/6", data={"dhcp6-http-url": "http://10.0.0.2:8001"})
+
+    with open(full_app.config["SETTINGS_FILE"]) as f:
+        settings = json.load(f)
+    assert settings["dhcp_http_url"] == "http://10.0.0.1:8000/"
+    assert settings["dhcp6_http_url"] == "http://10.0.0.2:8001/"
+    assert full_app.config["KEA_HTTP_URL"] == "http://10.0.0.1:8000/"
+    assert full_app.config["KEA_HTTP_URL6"] == "http://10.0.0.2:8001/"
+
+
+def test_save_app_settings_rejects_an_unusable_http_url(full_app, full_client):
+    response = full_client.post("/save-app-settings", data={
+        "kea-reload-strategy": "http",
+        "dhcp-http-url": "ftp://kea.lan",
+    })
+    assert response.status_code == 302  # redirects back with a flashed error, nothing saved
+
+    with full_client.session_transaction() as sess:
+        flashes = dict(sess.get("_flashes", []))
+    assert any("dhcp-http-url" in msg for msg in flashes.values())
+    assert not full_app.config.get("KEA_HTTP_URL")
+
+
+def test_save_app_settings_blank_http_url_stays_blank(full_app, full_client):
+    """Blank is the normal case: read the endpoint out of the Kea config."""
+    response = full_client.post("/save-app-settings", data={"kea-reload-strategy": "http"})
+    assert response.status_code == 302
+
+    with open(full_app.config["SETTINGS_FILE"]) as f:
+        settings = json.load(f)
+    assert settings["dhcp_http_url"] == ""
+
 
 
 def test_index_renders_pool_group_with_expandable_subnets(dashboard_client, dashboard_app):

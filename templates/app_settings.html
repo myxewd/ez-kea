@@ -11,14 +11,19 @@
 {% set settings_prefix = 'dhcp6' if v6 else 'dhcp' %}
 {% set save_endpoint = 'main.system.save_app_settings_version' if v6 else 'main.system.save_app_settings' %}
 {% set save_endpoint_kwargs = {'version': '6'} if v6 else {} %}
+{# A remote HTTP endpoint has no local config file, binary or reload strategy:
+   while one is selected this page shows that endpoint's own settings instead
+   of fields that would repoint this installation's Kea at the wrong place. #}
+{% set remote = kea_active_instance if kea_active_instance and kea_active_instance.mode == 'http' else None %}
 
-{% block title %}Global Settings - EZ-KEA{% endblock %}
+{% block title %}{{ 'Endpoint Settings' if remote else 'Global Settings' }} - EZ-KEA{% endblock %}
 
 {% block content %}
 <div class="page-header">
-  <h1><i data-lucide="wrench"></i> Global Settings</h1>
+  <h1><i data-lucide="wrench"></i> {{ 'Endpoint Settings' if remote else 'Global Settings' }}</h1>
 </div>
 
+{% if not remote %}
 <div style="margin-bottom: 1.5rem;">
   <div class="segmented-toggle">
     <a href="{{ url_for('main.system.app_settings') }}" class="segmented-toggle-option {{ 'active' if not v6 }}">
@@ -29,7 +34,79 @@
     </a>
   </div>
 </div>
+{% endif %}
 
+{% if remote %}
+<!-- ── Remote endpoint settings ────────────────────────────────────────────── -->
+<div class="alert alert-info" style="display:flex;align-items:flex-start;gap:0.6rem;">
+  <i data-lucide="server" style="width:18px;height:18px;flex-shrink:0;margin-top:2px;"></i>
+  <div>
+    You are managing a <strong>remote Kea endpoint over its HTTP control channel</strong>.
+    Its configuration is pulled into <code>{{ ez_kea_settings[settings_prefix ~ '_config_file'] }}</code>
+    and pushed back with <code>config-test</code> → <code>config-set</code>.
+    File paths, Kea binary paths and reload strategies on this page belong to the local
+    installation, so they are not shown — and editing them here could never affect this daemon.
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header" style="justify-content:space-between;">
+    <div>
+      <h2><i data-lucide="server"></i> {{ remote.name }}</h2>
+      <span style="font-size:.8rem;color:var(--text-secondary);">Stored in the EZ-KEA database, one row per endpoint.</span>
+    </div>
+    <a href="{{ url_for('main.instances.instances_page') }}" class="btn btn-outline" style="font-size:0.8rem;padding:0.3rem 0.6rem;">All endpoints</a>
+  </div>
+  <div class="card-body">
+    <form method="POST" action="{{ url_for('main.instances.edit_instance', instance_id=remote.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1rem;margin-bottom:1rem;">
+        <div class="form-group" style="margin-bottom:0;">
+          <label class="form-label" for="ep-name">Name</label>
+          <input class="form-control" id="ep-name" name="name" type="text" value="{{ remote.name }}">
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label class="form-label" for="ep-url4">DHCPv4 control URL</label>
+          <input class="form-control" id="ep-url4" name="http_url" type="text"
+                 value="{{ remote.http_url }}" placeholder="http://10.0.0.5:8000/">
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label class="form-label" for="ep-url6">DHCPv6 control URL <span class="text-secondary" style="font-size:0.8rem;">(optional)</span></label>
+          <input class="form-control" id="ep-url6" name="http_url6" type="text"
+                 value="{{ remote.http_url6 }}" placeholder="http://10.0.0.5:8001/">
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label class="form-label" for="ep-user">Basic auth user</label>
+          <input class="form-control" id="ep-user" name="http_user" type="text"
+                 value="{{ remote.http_user }}" autocomplete="off">
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label class="form-label" for="ep-pass">Basic auth password <span class="text-secondary" style="font-size:0.8rem;">(blank keeps the stored one)</span></label>
+          <input class="form-control" id="ep-pass" name="http_password" type="password"
+                 autocomplete="new-password" placeholder="{{ '••••••••' if remote.http_password else '' }}">
+        </div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;">
+        <button type="submit" class="btn btn-primary"><i data-lucide="save"></i> Save Endpoint</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="card" style="margin-top:1.5rem;">
+  <div class="card-header"><h2><i data-lucide="refresh-cw"></i> Synchronise</h2></div>
+  <div class="card-body" style="display:flex;gap:0.75rem;flex-wrap:wrap;">
+    <form method="POST" action="{{ url_for('main.instances.pull_instance', instance_id=remote.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit" class="btn btn-outline"><i data-lucide="download"></i> Pull config from the daemon</button>
+    </form>
+    <span class="text-secondary" style="font-size:0.85rem;align-self:center;">
+      Replaces the local mirror with the configuration the daemon is running now
+      (<code>config-get</code>), backing up the previous mirror first.
+    </span>
+  </div>
+</div>
+{% else %}
 <!-- ── EZ-KEA Application Settings ─────────────────────────────────────────── -->
 <div class="card">
   <div class="card-header" style="justify-content: space-between;">
@@ -122,8 +199,9 @@
       <div class="form-group">
         <label class="form-label" for="kea-reload-strategy">Reload Strategy</label>
         <select class="form-control" id="kea-reload-strategy" name="kea-reload-strategy" onchange="updateDockerFieldsVisibility()">
-          <option value="keactrl" {% if ez_kea_settings.kea_reload_strategy not in ('sighup', 'control-socket') %}selected{% endif %}>keactrl reload</option>
+          <option value="keactrl" {% if ez_kea_settings.kea_reload_strategy not in ('sighup', 'control-socket', 'http') %}selected{% endif %}>keactrl reload</option>
           <option value="control-socket" {% if ez_kea_settings.kea_reload_strategy == 'control-socket' %}selected{% endif %}>Control socket (config-reload)</option>
+          <option value="http" {% if ez_kea_settings.kea_reload_strategy == 'http' %}selected{% endif %}>Kea HTTP API (config-test, then config-set)</option>
           <option value="sighup" {% if ez_kea_settings.kea_reload_strategy == 'sighup' %}selected{% endif %}>Docker container SIGHUP (docker kill -s HUP)</option>
         </select>
         <small style="color:var(--text-secondary);">
@@ -133,8 +211,34 @@
           actually succeeded. It requires a <code>unix</code> entry under the daemon's
           <code>control-sockets</code>.<br>
           Minimal Kea Docker images often don't ship <code>/etc/kea/keactrl.conf</code>, which
-          <code>keactrl reload</code> requires — "Docker container SIGHUP" covers those.
+          <code>keactrl reload</code> requires — "Docker container SIGHUP" covers those.<br>
+          <strong>Kea HTTP API</strong> pushes the configuration to the running daemon over its own
+          HTTP/HTTPS control socket, in two steps: <code>config-test</code> (Kea's own parser judging
+          this exact document) and only then <code>config-set</code>. Nothing is applied if the test is
+          refused, and the file on disk stays the source of truth, so a restart lands on the same
+          configuration. Needs an <code>http</code> (or <code>https</code>) entry under the daemon's
+          <code>control-sockets</code> — Kea 2.7.2 and later.
           This is never guessed; pick it explicitly.
+        </small>
+      </div>
+      <div class="form-group" id="http-url-group">
+        <label class="form-label" for="{{ settings_prefix }}-http-url">Kea HTTP Control URL <span style="color:var(--text-secondary);font-size:.8rem;">(optional — blank reads it from the Kea config)</span></label>
+        <input type="text" class="form-control" id="{{ settings_prefix }}-http-url" name="{{ settings_prefix }}-http-url"
+               value="{{ ez_kea_settings[settings_prefix ~ '_http_url'] }}"
+               placeholder="http://{% if v6 %}[::1]{% else %}127.0.0.1{% endif %}:8000/">
+        <small style="color:var(--text-secondary);">
+          The daemon's HTTP/HTTPS control socket, e.g. <code>http://127.0.0.1:8000/</code>.
+          Leave blank to use the <code>http</code>/<code>https</code> entry in the daemon's
+          <code>control-sockets</code> (defaults <code>127.0.0.1:8000</code>, and
+          <code>[::1]:8000</code> for DHCPv6). Set it when the listener is not described there —
+          another host, or a port published out of a container.
+          <br><strong>Kea 3.x refuses an unauthenticated HTTP control channel at startup</strong>
+          ("Unsecured HTTP control channel"), so configure basic auth on the daemon
+          (<code>user-file</code>/<code>password-file</code> — a clear-text password in Kea's own
+          config is refused too) and set <code>KEA_HTTP_USER</code>/<code>KEA_HTTP_PASSWORD</code> in
+          EZ-KEA's environment. Credentials are deliberately environment-only, never a field on this
+          page. Client certificates are not supported, so an HTTPS listener must set
+          <code>cert-required</code> to <code>false</code>.
         </small>
       </div>
       <div class="form-group" id="docker-container-group">
@@ -159,6 +263,7 @@ function updateDockerFieldsVisibility() {
     var strategy = document.getElementById('kea-reload-strategy').value;
     document.getElementById('docker-path-group').style.display = looksDocker ? '' : 'none';
     document.getElementById('docker-container-group').style.display = (strategy === 'sighup') ? '' : 'none';
+    document.getElementById('http-url-group').style.display = (strategy === 'http') ? '' : 'none';
 }
 document.addEventListener('DOMContentLoaded', updateDockerFieldsVisibility);
 
@@ -189,4 +294,5 @@ function autoDetectKeaConfigs() {
 }
 {% endif %}
 </script>
+{% endif %}
 {% endblock %}

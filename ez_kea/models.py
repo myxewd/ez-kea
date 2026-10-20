@@ -59,3 +59,40 @@ class SystemSetting(db.Model):
 
     key   = db.Column(db.String(64), primary_key=True)
     value = db.Column(db.Text, default="")
+
+class KeaInstance(db.Model):
+    """
+    One Kea management endpoint the operator can point EZ-KEA at.
+
+    Two kinds, because a Kea host can be reached two ways:
+
+    * "local" -- EZ-KEA runs on the Kea host and edits the daemon's own config
+      files (the pre-existing single-instance model, now one row among many).
+    * "http" -- the daemon exposes its own HTTP/HTTPS control socket, so
+      EZ-KEA pulls the live configuration with config-get into a local mirror
+      file, edits that mirror, and pushes it back with config-test/config-set.
+      The mirror is a cache of what the daemon reported, so a page render never
+      has to wait for the network.
+
+    The password column is plaintext, exactly like the SMTP password in
+    SystemSetting: the database is the trust boundary here, and the column is
+    never rendered back to the browser.
+    """
+    __tablename__ = "kea_instances"
+
+    id               = db.Column(db.Integer, primary_key=True)
+    name             = db.Column(db.String(64), nullable=False)
+    mode             = db.Column(db.String(8), nullable=False, default="local")
+
+    # "local" mode: the files the daemon itself reads.
+    dhcp4_config_file = db.Column(db.String(512), default="")
+    dhcp6_config_file = db.Column(db.String(512), default="")
+
+    # "http" mode: the daemon's control channels (v6 optional) and credentials.
+    http_url      = db.Column(db.String(255), default="")
+    http_url6     = db.Column(db.String(255), default="")
+    http_user     = db.Column(db.String(128), default="")
+    http_password = db.Column(db.String(255), default="")
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+

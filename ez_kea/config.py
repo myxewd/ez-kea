@@ -62,6 +62,10 @@ class Config:
     # IP?"), so this defaults well below LOG_INDEX_INTERVAL.
     STATE_INDEX_INTERVAL = int(os.getenv("STATE_INDEX_INTERVAL", "20"))
 
+    # Where an "http" Kea instance's pulled configuration is mirrored. One
+    # directory per instance; safe to delete (it is a cache of what the daemon
+    # reported, refreshed by "Pull" on the Endpoints page).
+    INSTANCE_DIR     = os.getenv("INSTANCE_DIR",     "./data/instances/")
     BACKUP_DIR       = os.getenv("BACKUP_DIR",       "./data/backups/")
     SETTINGS_FILE    = os.getenv("SETTINGS_FILE",    "./data/ez-kea-settings.json")
     SECRET_KEY       = os.getenv("SECRET_KEY",       "dev")
@@ -106,3 +110,24 @@ class Config:
     # here is worse than requiring one extra setting.
     KEA_RELOAD_STRATEGY = os.getenv("KEA_RELOAD_STRATEGY", "keactrl")
     KEA_DOCKER_CONTAINER = os.getenv("KEA_DOCKER_CONTAINER", "")
+
+    # Endpoint of the daemon's own HTTP/HTTPS control channel, for the "http"
+    # reload strategy (config-test, then config-set -- see core/kea_ctrl.py).
+    # Blank means "read it out of the Kea config": the http/https entry in the
+    # daemon's control-sockets list, whose socket-address/socket-port default to
+    # 127.0.0.1:8000 (::1:8000 for DHCPv6). Set it explicitly when the listener
+    # is not described there -- a daemon in another container with a published
+    # port, another host, or an HTTPS endpoint behind a proxy.
+    # Per version: the two daemons cannot share an address/port pair, so one
+    # shared override could only ever point at one of them.
+    KEA_HTTP_URL  = os.getenv("KEA_HTTP_URL", "")
+    KEA_HTTP_URL6 = os.getenv("KEA_HTTP_URL6", "")
+
+    # HTTP Basic credentials for that control channel. Environment-only on
+    # purpose: secrets do not belong in ez-kea-settings.json, and Kea 3.x will
+    # not start with an unauthenticated HTTP control channel anyway. Pair these
+    # with the daemon's "authentication": {"type": "basic", ...} block, which
+    # must use user-file/password-file -- Kea refuses a clear-text password in
+    # its own config with "use of clear text 'password' is NOT SECURE".
+    KEA_HTTP_USER     = os.getenv("KEA_HTTP_USER", "")
+    KEA_HTTP_PASSWORD = os.getenv("KEA_HTTP_PASSWORD", "")

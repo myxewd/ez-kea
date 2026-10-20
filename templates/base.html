@@ -28,6 +28,7 @@
     
     <nav class="navbar">
         <div class="navbar-container">
+            <div class="navbar-brand-row" style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;min-width:0;">
             <a href="{{ url_for('main.system.index') }}" class="navbar-brand" style="display:flex;align-items:center;gap:1rem;">
                 <span><img src="{{ url_for('static', filename='icons/icon-64.png') }}" alt="" width="26" height="26" style="vertical-align:middle;border-radius:6px;"> EZ-KEA</span>
                 {% if ez_kea_mode == 'LIVE' %}
@@ -41,6 +42,36 @@
                 {% endif %}
             </a>
 
+            {# The Kea endpoint selector: the whole UI acts on whichever entry is
+               chosen here, so it lives on the left of the brand row rather than
+               inside a settings page somewhere. Submitting on change keeps it a
+               mode switch (and works with JS disabled as a plain POST). #}
+            {% if current_user.is_authenticated and kea_instances %}
+            <form method="POST" action="{{ url_for('main.instances.select_instance') }}"
+                  style="display:flex;align-items:center;gap:0.35rem;margin:0;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <label for="keaInstanceSelect" title="Kea management endpoint"
+                       style="display:flex;align-items:center;color:var(--text-secondary);margin:0;">
+                    <i data-lucide="server" style="width:15px;height:15px;"></i>
+                </label>
+                <select id="keaInstanceSelect" name="instance_id" onchange="this.form.submit()"
+                        title="Kea management endpoint"
+                        style="background:var(--card-bg);color:var(--text-primary);border:1px solid var(--card-border);border-radius:6px;padding:0.3rem 0.5rem;font-size:0.8rem;max-width:14rem;">
+                    {% if kea_local_present %}
+                    <option value="default" {% if not kea_active_instance %}selected{% endif %}>This installation</option>
+                    {% endif %}
+                    {% for inst in kea_instances %}
+                    <option value="{{ inst.id }}" {% if kea_active_instance and kea_active_instance.id == inst.id %}selected{% endif %}>{{ inst.name }}</option>
+                    {% endfor %}
+                </select>
+                <a href="{{ url_for('main.instances.instances_page') }}" title="Manage Kea endpoints"
+                   style="color:var(--text-secondary);display:flex;align-items:center;">
+                    <i data-lucide="settings-2" style="width:15px;height:15px;"></i>
+                </a>
+            </form>
+            {% endif %}
+            </div>
+
             {# Account control sits on the brand row, before the nav list, so
                that DOM order matches the rendered two-row layout (brand +
                account on top, nav links full-width beneath). Keeping it after
@@ -52,6 +83,7 @@
                     <i data-lucide="chevron-down" class="chevron"></i>
                 </button>
                 <div class="navbar-dropdown" id="navAccountMenu">
+                    <a href="{{ url_for('main.instances.instances_page') }}" class="navbar-dropdown-item"><i data-lucide="server"></i> Kea Endpoints</a>
                     <a href="{{ url_for('auth.profile') }}" class="navbar-dropdown-item"><i data-lucide="user"></i> Profile</a>
                     {% if current_user.is_admin %}
                     <div class="navbar-dropdown-divider"></div>
@@ -68,6 +100,7 @@
             <ul class="navbar-nav">
                 <li><a href="{{ url_for('main.system.index') }}" class="nav-link"><i data-lucide="home"></i> Home</a></li>
 
+                {% if kea_features.ipv4 %}
                 <li class="nav-dropdown">
                     <button type="button" class="nav-link nav-dropdown-btn" id="navIpv4Btn" onclick="toggleNavMenu('navIpv4Menu', 'navIpv4Btn', event)">
                         <i data-lucide="network"></i> IPv4 <i data-lucide="chevron-down" class="chevron"></i>
@@ -76,12 +109,16 @@
                         <a href="{{ url_for('main.system.global_settings') }}" class="navbar-dropdown-item"><i data-lucide="settings"></i> Settings</a>
                         <a href="{{ url_for('main.dhcp4.pools') }}" class="navbar-dropdown-item"><i data-lucide="folder-tree"></i> Pools</a>
                         <a href="{{ url_for('main.dhcp4.mac_reservations') }}" class="navbar-dropdown-item"><i data-lucide="hard-drive"></i> Reservations</a>
+                        {% if kea_features.leases %}
                         <a href="{{ url_for('main.dhcp4.leases') }}" class="navbar-dropdown-item"><i data-lucide="list"></i> Leases</a>
+                        {% endif %}
                         <a href="{{ url_for('main.client_classes.client_classes') }}" class="navbar-dropdown-item"><i data-lucide="tags"></i> Client Classes</a>
                         <a href="{{ url_for('main.system.advanced_config') }}" class="navbar-dropdown-item"><i data-lucide="file-json"></i> Advanced Config</a>
                     </div>
                 </li>
+                {% endif %}
 
+                {% if kea_features.ipv6 %}
                 <li class="nav-dropdown">
                     <button type="button" class="nav-link nav-dropdown-btn" id="navIpv6Btn" onclick="toggleNavMenu('navIpv6Menu', 'navIpv6Btn', event)">
                         <i data-lucide="globe"></i> IPv6 <i data-lucide="chevron-down" class="chevron"></i>
@@ -90,15 +127,20 @@
                         <a href="{{ url_for('main.system.global_settings_version', version='6') }}" class="navbar-dropdown-item"><i data-lucide="settings"></i> Settings</a>
                         <a href="{{ url_for('main.dhcp6.pools6') }}" class="navbar-dropdown-item"><i data-lucide="folder-tree"></i> Pools</a>
                         <a href="{{ url_for('main.dhcp6.reservations6') }}" class="navbar-dropdown-item"><i data-lucide="hard-drive"></i> Reservations</a>
+                        {% if kea_features.leases6 %}
                         <a href="{{ url_for('main.dhcp6.leases6') }}" class="navbar-dropdown-item"><i data-lucide="list"></i> Leases</a>
+                        {% endif %}
                         <a href="{{ url_for('main.client_classes.client_classes_version', version='6') }}" class="navbar-dropdown-item"><i data-lucide="tags"></i> Client Classes</a>
                         <a href="{{ url_for('main.system.advanced_config_version', version='6') }}" class="navbar-dropdown-item"><i data-lucide="file-json"></i> Advanced Config</a>
                     </div>
                 </li>
+                {% endif %}
 
                 <li><a href="{{ url_for('main.ha.high_availability') }}" class="nav-link"><i data-lucide="shield-check"></i> HA</a></li>
                 <li><a href="{{ url_for('main.system.app_settings') }}" class="nav-link"><i data-lucide="settings"></i> Global Settings</a></li>
+                {% if kea_features.logs %}
                 <li><a href="{{ url_for('main.system.logs') }}" class="nav-link"><i data-lucide="terminal"></i> Log Search</a></li>
+                {% endif %}
             </ul>
         </div>
     </nav>

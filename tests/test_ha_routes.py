@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 import json
+from unittest.mock import patch
+
 import pytest
 from ez_kea import create_app
 from conftest import login
@@ -192,9 +194,9 @@ def test_api_ha_status_reads_both_control_socket_spellings(client, app, tmp_path
         thread.join(timeout=2)
 
 
-def test_api_ha_status_http_only_daemon_returns_clear_error(client, app):
-    """A Kea 3.0+ daemon exposing only an HTTP listener has no channel we
-    speak — that must be a clean 502, not a connect() to a bogus path."""
+def test_api_ha_status_uses_the_http_channel(client, app):
+    """A Kea 3.0+ daemon exposing only an HTTP listener is a channel we do
+    speak: ha-heartbeat takes no parameters, so HTTP carries it unchanged."""
     config = json.loads(open(app.config["DHCP_CONFIG_FILE"]).read())
     config["Dhcp4"]["control-sockets"] = [
         {"socket-type": "http", "socket-address": "127.0.0.1", "socket-port": 8000},
@@ -202,7 +204,20 @@ def test_api_ha_status_http_only_daemon_returns_clear_error(client, app):
     with open(app.config["DHCP_CONFIG_FILE"], "w") as f:
         json.dump(config, f)
 
+    with patch("ez_kea.core.kea_ctrl.send_http_command",
+               return_value={"result": 0, "text": "HA peer status returned.",
+                             "arguments": {"state": "hot-standby"}}) as http_command:
+        response = client.get("/api/ha-status")
+
+    assert response.status_code == 200
+    assert response.get_json()["state"] == {"state": "hot-standby"}
+    assert http_command.call_args[0][1] == "ha-heartbeat"
+
+
+def test_api_ha_status_without_any_channel_returns_clear_error(client, app):
+    """Neither a UNIX socket nor an HTTP listener: a clean 502, not a
+    connect() to a bogus path."""
     response = client.get("/api/ha-status")
 
     assert response.status_code == 502
-    assert "No UNIX control socket" in response.get_json()["error"]
+    assert "No UNIX or HTTP control channel" in response.get_json()["error"]

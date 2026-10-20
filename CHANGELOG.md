@@ -12,6 +12,70 @@ reads and always backs it up first.
 
 ### Added
 
+- **Multiple Kea endpoints, selected from the navbar.** A new Endpoints page
+  registers Kea instances and the selector at the top left of every page
+  switches the whole UI to the chosen one. Two kinds: *local* (this host's
+  daemon, its own config files — the pre-existing behaviour, now one entry
+  among many) and *HTTP* (a daemon's own HTTP/HTTPS control socket). Adding an
+  HTTP endpoint pulls the running configuration with `config-get` into a local
+  mirror under `INSTANCE_DIR`, every page reads that mirror, Apply pushes it
+  back with `config-test` → `config-set`, and **Pull config** re-syncs on
+  demand. The selection lives in the session and is materialised per request
+  (`InstanceScopedConfig` over a `flask.g` override), so no route had to learn
+  what an endpoint is and two concurrent operators cannot see each other's
+  daemon. Deleting an endpoint keeps its mirror directory: it is a copy of
+  somebody's Kea configuration, not a cache to throw away silently.
+
+  The UI follows what an endpoint can actually do, rather than assuming a local
+  daemon: "This installation" is listed only when startup discovery found one
+  (a standalone EZ-KEA managing remote endpoints selects its first endpoint
+  instead), the IPv6 menu and dashboard card disappear without a v6 control
+  channel, Log Search disappears for a remote endpoint (its logs stay on its own
+  host), and the lease table is pulled rather than hidden: `lease4-get-all` /
+  `lease6-get-all` land in a per-endpoint memfile mirror, so the Leases page,
+  its search index (now also per endpoint) and the dashboard's active-lease
+  count describe the selected daemon. The local `kea-dhcpN -t` pre-check is
+  skipped for a remote endpoint — its mirror references hook libraries and auth
+  files that only exist on the daemon's host, and the daemon's own
+  `config-test` is the check that matters — and an endpoint's "Global Settings" page shows
+  its URL/credentials instead of this installation's config-file and binary
+  paths. The same checks run as request guards, so a bookmark to a hidden page
+  is refused with an explanation rather than rendered empty.
+
+- **Applying configuration through Kea's own HTTP API.** A fourth reload
+  strategy (`KEA_RELOAD_STRATEGY=http`, "Kea HTTP API" in Application Settings)
+  pushes the document EZ-KEA just wrote to the running daemon over its
+  HTTP/HTTPS control socket — `config-test` first, `config-set` only if Kea
+  accepted the test. A configuration the daemon refuses never reaches it, no
+  reload/signal/socket file is involved, and because `config-set` keeps the new
+  configuration in memory only, the file on disk stays the durable copy that a
+  restart and Backups/Restore both act on. The endpoint is read from the
+  daemon's `control-sockets` entry (defaults `127.0.0.1:8000`, and
+  `[::1]:8000` for DHCPv6) unless the per-version `KEA_HTTP_URL`/`KEA_HTTP_URL6`
+  setting (or the matching field on that version's Application Settings page)
+  names one — per version because the two daemons cannot share a port. Status badges and the HA heartbeat now use whichever channel the daemon
+  exposes, so an HTTP-only daemon reads as reachable instead of unconfigured.
+  Kea 2.7.2 and later. Kea 3.x refuses to start with an unauthenticated HTTP
+  control channel (and with a clear-text password of its own), so HTTP Basic
+  credentials are read from `KEA_HTTP_USER`/`KEA_HTTP_PASSWORD` — environment
+  only, never a file EZ-KEA writes — and a 401 is reported with that hint.
+  HTTPS works for the transport against the system trust store; client
+  certificates are not supported, so an HTTPS listener needs
+  `cert-required: false`. Verified end to end against Kea 3.2.1: an accepted
+  change applies live through `config-test`→`config-set`, a rejected one stops
+  at `config-test` with the daemon still serving its previous configuration,
+  and `config-set` leaves the file on disk untouched.
+
+- **A Docker deployment, `deploy/`, with its own walk-through.** Two containers
+  — EZ-KEA and the daemon — sharing one config directory mounted at the same
+  absolute path in both, plus a `kea.env.example`, an initial config and
+  `docs/deployment.md`. The document records the parts that fail silently if
+  they are wrong, all of them measured against a real `kea-dhcp4` 2.2.0: the
+  control socket is only reachable by the account that owns it (so the socket's
+  directory is handed over and the daemon stops running as root), the
+  pre-save `-t` check needs to be able to read `/etc/kea`, and a DHCP daemon
+  inside Docker's default bridge cannot serve the hosts it is supposed to serve.
+
 - **Client-class editor.** Kea's `client-classes` are now editable at both
   DHCP versions: name, the `test` expression, the DHCPv4 fixed-header fields
   (`next-server` / `boot-file-name`), and per-class `option-data`.

@@ -80,6 +80,22 @@ def test_config_file(config_file: str, app_config: Dict[str, Any],
 
     from .security import InvalidKeaCommandError, validate_kea_command
 
+    # A remote endpoint's file is a local mirror of another host's config: the
+    # daemon's own config-test is the authority there, and running this host's
+    # -t against it can fail for reasons that have nothing to do with the edit
+    # (hook libraries, TLS/auth files that only exist on the daemon's host).
+    try:
+        from .instances import local_syntax_check_applicable
+        if not local_syntax_check_applicable():
+            return SyntaxCheckResult(
+                False,
+                "Skipped: this is a remote endpoint, where the daemon's own "
+                "config-test validates the configuration at apply time.",
+                False,
+            )
+    except Exception:  # pragma: no cover - never let this decide a save
+        pass
+
     cmd_key, in_container_key = DAEMON_COMMAND_KEYS.get(dhcp_key, DAEMON_COMMAND_KEYS["Dhcp4"])
     binary = app_config.get(cmd_key, f"kea-dhcp{dhcp_key[-1]}")
     try:

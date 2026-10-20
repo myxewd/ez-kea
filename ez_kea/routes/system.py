@@ -23,8 +23,13 @@ from ..core.config_manager import (
     with_config_lock, config_lock, bootstrap_config, bootstrap_config6, _DEFAULT_KEA6_CONFIG,
 )
 from ..core.settings_manager import load_settings, save_settings
+from ..core.instances import config_snapshot
 from ..core.security import validate_kea_command, validate_log_file_path, InvalidKeaCommandError, InvalidLogPathError
-from ..core.kea_ctrl import send_command, find_unix_socket_path, ControlChannelError
+from ..core.kea_ctrl import (
+    send_command, find_unix_socket_path, find_http_endpoint, normalize_http_endpoint,
+    push_config, config_document_for_push, send_command_any,
+    ConfigRejectedError, ControlChannelError,
+)
 from ..core import state_index
 from ..core.ha_manager import get_ha_params
 from ..core.validation import (
@@ -85,6 +90,8 @@ def _global_settings_field_names(version: str) -> Dict[str, str]:
             "leases_file_field": "dhcp6-leases-file",
             "config_file_in_container_field": "dhcp6-config-file-in-container",
             "log_file_in_container_field": "dhcp6-log-file-in-container",
+            "http_url_field": "dhcp6-http-url",
+            "http_url_config_key": "KEA_HTTP_URL6",
             "settings_prefix": "dhcp6",
             "cmd_settings_key": "kea_dhcp6_cmd",
         }
@@ -95,6 +102,8 @@ def _global_settings_field_names(version: str) -> Dict[str, str]:
         "leases_file_field": "dhcp-leases-file",
         "config_file_in_container_field": "dhcp-config-file-in-container",
         "log_file_in_container_field": "dhcp-log-file-in-container",
+        "http_url_field": "dhcp-http-url",
+        "http_url_config_key": "KEA_HTTP_URL",
         "settings_prefix": "dhcp",
         "cmd_settings_key": "kea_dhcp4_cmd",
     }
@@ -124,6 +133,7 @@ def _resolve_daemon_config(version: str) -> Dict[str, str]:
             "log_file_in_container": current_app.config.get("DHCP6_LOG_FILE_IN_CONTAINER", ""),
             "dhcp_root_key": "Dhcp6",
             "logger_name": "kea-dhcp6",
+            "http_url_key": "KEA_HTTP_URL6",
         }
     return {
         "config_file": current_app.config["DHCP_CONFIG_FILE"],
@@ -134,6 +144,7 @@ def _resolve_daemon_config(version: str) -> Dict[str, str]:
         "log_file_in_container": current_app.config.get("DHCP_LOG_FILE_IN_CONTAINER", ""),
         "dhcp_root_key": "Dhcp4",
         "logger_name": "kea-dhcp4",
+        "http_url_key": "KEA_HTTP_URL",
     }
 
 
@@ -378,22 +389,35 @@ def index() -> str:
 @login_required
 def api_daemon_status(version: str) -> Union[Response, Tuple[Response, int]]:
     """Live DHCPv4/DHCPv6 daemon status via `status-get` on the daemon's own
-    control socket, for the homepage's async health badge. Fetched
-    client-side (not baked into index()'s render) so a slow or unreachable
-    socket can't hold up the rest of the dashboard."""
+    control channel (UNIX socket, or its HTTP listener when that is all it
+    has), for the homepage's async health badge. Fetched client-side (not baked
+    into index()'s render) so a slow or unreachable socket can't hold up the
+    rest of the dashboard."""
     if version not in ("4", "6"):
         return _invalid_version_response()
     daemon = _resolve_daemon_config(version)
     config = load_json(daemon["config_file"], default=_DEFAULT_KEA6_CONFIG if version == "6" else None)
-    socket_path = find_unix_socket_path(config, daemon["dhcp_root_key"])
-    if not socket_path:
+    http_override = str(current_app.config.get(daemon["http_url_key"], "") or "").strip()
+    # Either channel answers status-get, so a daemon configured with only an
+    # HTTP control socket is fully reachable — reporting it as unconfigured
+    # would be exactly the false "down" badge this check exists to avoid.
+    try:
+        has_any_channel = bool(find_unix_socket_path(config, daemon["dhcp_root_key"])) or bool(
+            http_override or find_http_endpoint(config, daemon["dhcp_root_key"])
+        )
+    except ControlChannelError as e:
+        return jsonify({"status": "unreachable", "message": str(e)})
+    if not has_any_channel:
         # Distinct from "unreachable": plenty of installs use the keactrl/
         # SIGHUP reload strategy and never configure a control socket at all
         # (see _reload_via_control_socket, which treats this the same way) —
         # that's a normal, unconfigured state, not a daemon that's down.
-        return jsonify({"status": "not_configured", "message": "No control socket configured."})
+        return jsonify({"status": "not_configured", "message": "No control channel configured."})
     try:
-        response = send_command(socket_path, "status-get")
+        response = send_command_any(
+            config, daemon["dhcp_root_key"], "status-get",
+            timeout=3.0, http_endpoint=http_override, http_auth=_http_auth(),
+        )
     except ControlChannelError as e:
         return jsonify({"status": "unreachable", "message": str(e)})
     if response.get("result") != 0:
@@ -446,10 +470,15 @@ def _test_config_impl(version: str) -> Union[Response, Tuple[Response, int]]:
     about what Kea accepts.
     """
     daemon = _resolve_daemon_config(version)
-    result = test_config_file(daemon["config_file"], dict(current_app.config),
+    result = test_config_file(daemon["config_file"], config_snapshot(current_app.config),
                               dhcp_key=daemon["dhcp_root_key"])
     if result.ok:
         return jsonify({"message": "Syntax check passed!"})
+    if not result.ran and "remote endpoint" in result.output.lower():
+        # A remote endpoint has no local daemon to ask; Apply runs the
+        # daemon's own config-test, which is the check that matters there.
+        # Reported as a pass so the Apply button proceeds.
+        return jsonify({"message": result.output, "skipped": True})
     if not result.ran:
         # The check itself could not run: the operator's command configuration
         # is refused (their input -> 400) or the environment cannot run it
@@ -511,8 +540,129 @@ def _reload_via_control_socket(version: str) -> Union[Response, Tuple[Response, 
     return jsonify({"message": "KEA service reloaded successfully!"})
 
 
+def _http_auth() -> Optional[Tuple[str, str]]:
+    """
+    Basic credentials for the HTTP control channel, from the environment.
+
+    Kea 3.x will not start with an unauthenticated HTTP control channel, and it
+    equally refuses a clear-text password in its own config, so the compliant
+    deployment authenticates with user-file/password-file -- which means EZ-KEA
+    has to send a credential. Half a credential is a configuration error worth
+    saying out loud rather than silently sending an unauthenticated request
+    that is guaranteed to be refused.
+    """
+    user = str(current_app.config.get("KEA_HTTP_USER", "") or "")
+    password = str(current_app.config.get("KEA_HTTP_PASSWORD", "") or "")
+    if not user and not password:
+        return None
+    if not user or not password:
+        raise ControlChannelError(
+            "KEA_HTTP_USER and KEA_HTTP_PASSWORD must be set together (the daemon "
+            "requires both, since Kea 3.x refuses an unauthenticated HTTP control channel)"
+        )
+    return (user, password)
+
+
+def _http_endpoint_for(daemon: Dict[str, str], config: Dict[str, Any]) -> str:
+    """
+    The HTTP control-channel URL for this daemon.
+
+    The per-version override (KEA_HTTP_URL / KEA_HTTP_URL6) wins when set: it is
+    the only way to reach a listener the edited config file does not describe
+    (another host, a port published out of a container, or an HTTPS endpoint
+    behind a proxy). Otherwise the URL is read out of the daemon's own
+    control-sockets entry, which is the normal case for a Kea 3.x daemon that
+    was given an http/https socket.
+
+    The override is per version because the two daemons cannot share an
+    address/port pair -- Kea refuses it -- so a single shared URL could only
+    ever apply to one of them.
+
+    Returns "" when neither is available; raises ControlChannelError when a
+    configured value is not a usable URL.
+    """
+    override = str(current_app.config.get(daemon["http_url_key"], "") or "").strip()
+    if override:
+        return normalize_http_endpoint(override)
+    return find_http_endpoint(config, daemon["dhcp_root_key"])
+
+
+def _apply_config_over_http(version: str) -> Union[Response, Tuple[Response, int]]:
+    """
+    Apply by pushing the on-disk document over the daemon's own HTTP control
+    channel: config-test first, config-set only if Kea accepted the test.
+
+    This is the one strategy that needs no reload binary, no signal and no UNIX
+    socket -- it asks the running daemon itself, and the daemon decides. The
+    document pushed is the file EZ-KEA just wrote (already checked with -t),
+    parsed and sent under the daemon's own section name, so a restart later
+    lands on the same configuration that is now running.
+
+    config-test is Kea's own check on that exact document, but the ARM is
+    explicit that it does not actually load the configuration, so a refused
+    config-set is still possible and is reported separately.
+    """
+    daemon = _resolve_daemon_config(version)
+    dhcp_key = daemon["dhcp_root_key"]
+    config = load_json(
+        daemon["config_file"],
+        default=_DEFAULT_KEA6_CONFIG if version == "6" else None,
+    )
+
+    try:
+        endpoint = _http_endpoint_for(daemon, config)
+        auth = _http_auth()
+    except ControlChannelError as e:
+        return jsonify({"error": f"The HTTP control channel is misconfigured: {e}"}), 500
+
+    if not endpoint:
+        return jsonify({
+            "error": f"Reload strategy is set to 'HTTP API' but {dhcp_key} has no http or "
+                     "https control socket configured. Add one under 'control-sockets' in the "
+                     "Kea config, or set the EZ-KEA HTTP URL in Application Settings, before "
+                     "applying."
+        }), 500
+
+    try:
+        document = config_document_for_push(config, dhcp_key)
+        response = push_config(endpoint, dhcp_key, document, auth=auth)
+    except ConfigRejectedError as e:
+        # Two different failures, because they leave the daemon in different
+        # states and need different fixes.
+        if e.phase == "config-test":
+            return jsonify({"error": (
+                f"Kea refused this configuration at config-test, so nothing was applied and "
+                f"the running daemon still has its previous configuration:\n\n{e.detail}\n\n"
+                "config-test is Kea's own parser judging this exact document, so its complaint "
+                f"above is what to fix. The file on disk already passed kea-dhcp{version} -t "
+                "and is unchanged."
+            )}), 500
+        return jsonify({"error": (
+            f"Kea passed config-test but refused the config-set, so this configuration is not "
+            f"running:\n\n{e.detail}\n\n"
+            "Kea keeps its previous configuration in that case; its log says whether it is "
+            "still serving. Nothing further was attempted."
+        )}), 500
+    except ControlChannelError as e:
+        return jsonify({"error": f"Could not apply the configuration over Kea's HTTP API: {e}"}), 500
+
+    message = "Configuration applied to the running Kea daemon (config-test, then config-set)."
+    arguments = response.get("arguments")
+    digest = arguments.get("hash") if isinstance(arguments, dict) else None
+    if isinstance(digest, str) and digest:
+        message += f" Kea is now running configuration {digest[:12]}."
+    return jsonify({"message": message})
+
+
 def _apply_config_impl(version: str) -> Union[Response, Tuple[Response, int]]:
-    """Validate syntax and reload the Kea service for `version` with the current config."""
+    """Make the running daemon for `version` use the current config file.
+
+    Every strategy first hands the file to `kea-dhcpN -t`; what happens after
+    that is the operator's explicit choice: a reload (`keactrl`, the UNIX
+    socket's `config-reload`, a container SIGHUP) or, with the "http" strategy,
+    a push of the same document over the daemon's HTTP control channel through
+    config-test and config-set.
+    """
     # Attempt syntax test first
     test_result = _test_config_impl(version)
     status_code = test_result[1] if isinstance(test_result, tuple) else getattr(test_result, 'status_code', 200)
@@ -522,6 +672,8 @@ def _apply_config_impl(version: str) -> Union[Response, Tuple[Response, int]]:
     strategy = current_app.config.get("KEA_RELOAD_STRATEGY", "keactrl")
     if strategy == "control-socket":
         return _reload_via_control_socket(version)
+    if strategy == "http":
+        return _apply_config_over_http(version)
     if strategy == "sighup":
         container = current_app.config.get("KEA_DOCKER_CONTAINER", "").strip()
         if not container:
@@ -799,7 +951,7 @@ def logs_reindex() -> Response:
     """
     from ..core import log_index
 
-    config = dict(current_app.config)
+    config = config_snapshot(current_app.config)
     log_index.rebuild(config["LOG_INDEX_DB"])
 
     def refill() -> None:
@@ -900,6 +1052,7 @@ def _build_app_settings_context(version: str = "4") -> Dict[str, Any]:
     ez_kea_settings[f"{prefix}_log_file_in_container"]    = daemon["log_file_in_container"]
     ez_kea_settings["kea_reload_strategy"]  = current_app.config.get("KEA_RELOAD_STRATEGY", "keactrl")
     ez_kea_settings["kea_docker_container"] = current_app.config.get("KEA_DOCKER_CONTAINER", "")
+    ez_kea_settings[f"{prefix}_http_url"]   = current_app.config.get(names["http_url_config_key"], "")
 
     return {
         "version": version,
@@ -1089,6 +1242,25 @@ def _save_app_settings_impl(version: str) -> Union[Response, Tuple[str, int]]:
         except InvalidKeaCommandError as e:
             errors.append(str(e))
 
+    # The HTTP control-channel URL is operator input that gets connected to,
+    # so it is validated here rather than at apply time -- a typo must not
+    # survive a save and only surface as a failed apply later. Blank stays
+    # valid: it means "read the endpoint out of the Kea config".
+    http_url_field = names["http_url_field"]
+    candidate_http_url = (
+        request.form[http_url_field].strip()
+        if http_url_field in request.form
+        else str(current_app.config.get(names["http_url_config_key"], "") or "").strip()
+    )
+    if candidate_http_url:
+        try:
+            # Stored in the canonical form the apply path will actually use, so
+            # the field cannot come back showing something different from what
+            # is being connected to.
+            candidate_http_url = normalize_http_endpoint(candidate_http_url)
+        except ControlChannelError as e:
+            errors.append(f"{http_url_field}: {e}")
+
     candidate_log_file = request.form.get(names["log_file_field"], "").strip() or daemon["log_file"]
     if candidate_log_file != daemon["log_file"]:
         try:
@@ -1216,6 +1388,7 @@ def _save_app_settings_impl(version: str) -> Union[Response, Tuple[str, int]]:
         if "kea-docker-container" in request.form
         else current_app.config.get("KEA_DOCKER_CONTAINER", "")
     )
+    new_settings[f"{prefix}_http_url"] = candidate_http_url
 
     # Also update the log file in Kea's own config so it's the source of
     # truth for the running daemon. Use the in-container path when one is
@@ -1275,6 +1448,7 @@ def _save_app_settings_impl(version: str) -> Union[Response, Tuple[str, int]]:
     current_app.config["DHCP6_LOG_FILE_IN_CONTAINER" if version == "6" else "DHCP_LOG_FILE_IN_CONTAINER"] = new_settings[f"{prefix}_log_file_in_container"]
     current_app.config["KEA_RELOAD_STRATEGY"] = new_settings["kea_reload_strategy"]
     current_app.config["KEA_DOCKER_CONTAINER"] = new_settings["kea_docker_container"]
+    current_app.config[names["http_url_config_key"]] = new_settings[f"{prefix}_http_url"]
 
     save_kea_config(config, current_config_file, current_app.config["BACKUP_DIR"])
     return redirect(url_for(redirect_endpoint, **redirect_kwargs))
@@ -1379,7 +1553,7 @@ def _save_advanced_config_impl(version: str) -> Union[Response, Tuple[str, int]]
     try:
         warning = save_validated_kea_config(
             parsed, config_file, current_app.config["BACKUP_DIR"],
-            dict(current_app.config), dhcp_key=daemon["dhcp_root_key"],
+            config_snapshot(current_app.config), dhcp_key=daemon["dhcp_root_key"],
         )
     except InvalidConfigError as e:
         context["errors"] = [e.message]
@@ -1453,7 +1627,7 @@ def api_discover() -> Response:
     from ..core.discovery import discover_environment
     # Force discovery by faking a non-existent settings file, so it sniffs /proc
     # and /etc instead of returning the user's saved overrides.
-    fake_config = dict(current_app.config)
+    fake_config = config_snapshot(current_app.config)
     fake_config["SETTINGS_FILE"] = "/nonexistent_force_discovery"
     env_info = discover_environment(fake_config)
     return jsonify(env_info)

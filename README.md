@@ -76,6 +76,25 @@ export HOST=0.0.0.0
 python3 app.py
 ```
 
+### Docker
+
+`deploy/` builds an EZ-KEA image that fetches the project from git at build
+time, and a two-service compose file that runs it next to a Kea container with a
+shared config directory:
+
+```bash
+cd deploy
+docker build -t ez-kea:0.10.1 --build-arg EZK_REF=v0.10.1 ./ezkea
+docker build -t ez-kea-kea:2.2.0 ./kea
+cp kea.env.example kea.env      # set SECRET_KEY
+docker compose --env-file kea.env up -d
+```
+
+[**docs/deployment.md**](docs/deployment.md) is the walk-through: paths and
+ownership, the three setups that silently break (where the daemon listens, who
+owns the control socket, whether the pre-save `kea-dhcp4 -t` check can read the
+config), reverse proxy, backup/restore, upgrades and troubleshooting.
+
 ## Pointing it at a real Kea
 
 If you already run Kea, EZ-KEA finds it — skip to the permissions note below.
@@ -123,13 +142,33 @@ daemon's own socket and reports whether the reload actually succeeded. Make sure
 the daemon has a `control-socket` (or 3.0+ `control-sockets`) block — ISC's
 shipped config does.
 
+Choose **Kea HTTP API** (`KEA_RELOAD_STRATEGY=http`) instead and EZ-KEA does not
+reload anything: it hands the configuration to the running daemon over its
+HTTP/HTTPS control channel, with **`config-test` first and `config-set` only if
+Kea accepted the test**. Nothing is applied when the test is refused, and the
+file on disk stays exactly what was pushed, so a restart lands on the same
+configuration. That needs an `http` (or `https`) entry in the daemon's
+`control-sockets` — Kea 2.7.2 and later — with a distinct address/port per
+daemon. Leave **Kea HTTP Control URL** blank to have it read from that config, or
+set it when the listener is not described there, e.g. a port published out of
+another container (`KEA_HTTP_URL` for DHCPv4, `KEA_HTTP_URL6` for DHCPv6 — one
+URL per daemon, since they cannot share a port).
+
+**Kea 3.x will not start with an unauthenticated HTTP control channel** — it
+exits with `Unsecured HTTP control channel` — and it refuses a clear-text
+password in its own config just as firmly. Configure basic authentication with
+`user-file`/`password-file` on the daemon and put the same credential in
+EZ-KEA's environment as `KEA_HTTP_USER`/`KEA_HTTP_PASSWORD` (never in a file
+EZ-KEA writes). Running Kea with `-X` also silences the policy check, at the
+cost of the policy check.
+
 ## Architecture
 
 One Python process (waitress serving a Flask app) on the same host as Kea.
 
 - **Discovery.** EZ-KEA determines the config file the running Kea process is actually using, so you never tell it where your config lives and it can't drift onto a stale copy. Mechanically it reads `/proc` for `kea-dhcp4` and `kea-dhcp6` and takes the path each daemon was launched with, falling back to `/etc/kea/` and then `/usr/local/etc/kea/`. Every path is overridable in Global Settings. With no Kea present it sandboxes to `./data/` and runs in demo mode.
 - **In-place editing.** Changes go into Kea's own JSON. Writes to a given config file are serialized with a lock.
-- **Backup, validate, apply.** Every config write copies the existing file first and aborts if that copy fails, keeping the hundred most recent (namespaced by a hash of the config path, so a restore can't grab the wrong file's backup). Applying runs `kea-dhcpN -t` and stops on failure, then reloads via `keactrl`, the control socket's `config-reload`, or a SIGHUP to a Docker container — an explicit setting, never guessed.
+- **Backup, validate, apply.** Every config write copies the existing file first and aborts if that copy fails, keeping the hundred most recent (namespaced by a hash of the config path, so a restore can't grab the wrong file's backup). Applying runs `kea-dhcpN -t` and stops on failure, then reloads via `keactrl`, the control socket's `config-reload`, a SIGHUP to a Docker container, or — without any reload at all — the daemon's HTTP API (`config-test` then `config-set`) — an explicit setting, never guessed.
 - **Storage.** Two embedded SQLite files under `./data/`: one for local accounts and settings, one a disposable log index that rebuilds itself if you delete it. No Postgres, no MySQL, no broker, nothing else to run.
 - **No egress.** No telemetry, no CDN, no update check, no license server. Fonts and icons are vendored; license keys verify offline against a public key compiled into the application. It runs on an isolated management VLAN with no internet access.
 
@@ -147,6 +186,7 @@ One Python process (waitress serving a Flask app) on the same host as Kea.
 - **Leases** — active DHCPv4 and DHCPv6 lease tables read from Kea's memfile CSV, with free-text search (MAC/IP/hostname, or DUID/IPv6/hostname for v6), a subnet CIDR filter, a status filter, an expiration-timeframe filter (presets like "expiring in the next 24 hours" plus a custom date range), sortable columns, CSV export, and pagination.
 - **Validation, backup and restore** — overlap and range checks in the forms, automatic pre-write backups, and restore from the UI. Every write — not just the Apply button — is handed to Kea's own `-t` syntax check and rolled back if the daemon refuses it, so a config Kea cannot load never stays on disk.
 - **Kea 2.x and 3.x** — EZ-KEA detects the daemon's version and writes the control-socket syntax that version accepts (3.0 renamed `control-socket` to `control-sockets`), and reads either. Exercised against Kea 2.0.2 and 3.2.0 in the testbed.
+- **Multiple Kea endpoints** — a selector at the top left of every page switches the whole UI to a registered Kea instance: a **local** one (this host's daemon, its own config files) or an **HTTP** one (any daemon exposing its own control socket). Adding an HTTP endpoint pulls the running configuration with `config-get` into a local mirror, every page reads that mirror, Apply pushes edits back with `config-test` → `config-set`, and **Pull config** re-syncs on demand. Selection lives in the session and is applied per request, so two operators on two different Kea servers never see each other's data. "This installation" only appears when a local Kea was actually detected, and the UI adapts to what an endpoint can honestly offer: no IPv6 menu (or dashboard card) without a v6 control channel, no Log Search for a remote endpoint (its logs stay on its own host), and an endpoint's own settings page instead of this installation's file/binary paths. The lease table is not hidden: it is pulled with `lease4-get-all`/`lease6-get-all` into a per-endpoint memfile mirror, so the Leases page, its search index and the dashboard's active-lease count all describe the selected daemon (the daemon needs the `libdhcp_lease_cmds.so` hook, shipped in `isc-kea-hooks`).
 - **Multi-user auth** — local accounts, optional TOTP two-factor with recovery codes, and SMTP-backed password reset. Accounts are administrator or standard; admins additionally manage users, licensing and email settings. There is no read-only role — any account can change DHCP configuration.
 
 Full reference is in the [wiki](https://github.com/fenleytech/ez-kea/wiki).

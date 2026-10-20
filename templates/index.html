@@ -49,6 +49,7 @@
 </div>
 
 <div class="row" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 1.5rem;">
+  {% if kea_features.ipv4 %}
   <div class="card">
     <div class="card-header">
       <h2><i data-lucide="network"></i> IPv4</h2>
@@ -90,11 +91,15 @@
         <a href="{{ url_for('main.system.global_settings') }}" class="btn btn-outline btn-sm"><i data-lucide="settings"></i> Settings</a>
         <a href="{{ url_for('main.dhcp4.pools') }}" class="btn btn-outline btn-sm"><i data-lucide="folder-tree"></i> Pools</a>
         <a href="{{ url_for('main.dhcp4.mac_reservations') }}" class="btn btn-outline btn-sm"><i data-lucide="hard-drive"></i> Reservations</a>
+        {% if kea_features.leases %}
         <a href="{{ url_for('main.dhcp4.leases') }}" class="btn btn-outline btn-sm"><i data-lucide="list"></i> Leases</a>
+        {% endif %}
       </div>
     </div>
   </div>
+  {% endif %}
 
+  {% if kea_features.ipv6 %}
   <div class="card">
     <div class="card-header">
       <h2><i data-lucide="globe"></i> IPv6</h2>
@@ -136,10 +141,13 @@
         <a href="{{ url_for('main.system.global_settings_version', version='6') }}" class="btn btn-outline btn-sm"><i data-lucide="settings"></i> Settings</a>
         <a href="{{ url_for('main.dhcp6.pools6') }}" class="btn btn-outline btn-sm"><i data-lucide="folder-tree"></i> Pools</a>
         <a href="{{ url_for('main.dhcp6.reservations6') }}" class="btn btn-outline btn-sm"><i data-lucide="hard-drive"></i> Reservations</a>
+        {% if kea_features.leases6 %}
         <a href="{{ url_for('main.dhcp6.leases6') }}" class="btn btn-outline btn-sm"><i data-lucide="list"></i> Leases</a>
+        {% endif %}
       </div>
     </div>
   </div>
+  {% endif %}
 </div>
 {% endblock %}
 

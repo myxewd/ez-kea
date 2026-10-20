@@ -8,6 +8,7 @@ from werkzeug.wrappers import Response
 from ..core.config_manager import load_json, save_kea_config, with_config_lock, _DEFAULT_KEA6_CONFIG
 from ..core.validation import classify_network_address, validate_mac_address, validate_ip_range, validate_duid, has_overlap, return_available_ips, get_active_leases, get_active_leases6, unix_to_human_readable, sanitize_hostname
 from ..core import state_index
+from ..core.instances import config_snapshot, ensure_leases
 from ..core.csv_export import stream_csv_response
 import ipaddress
 
@@ -476,7 +477,7 @@ def reservations6() -> str:
 
     conn = state_index.connect(current_app.config["STATE_INDEX_DB"])
     try:
-        state_index.ingest_all(dict(current_app.config), conn, kinds=["reservation6"])
+        state_index.ingest_all(config_snapshot(current_app.config), conn, kinds=["reservation6"])
         result = state_index.search_reservation6(
             conn, q=q or None, subnet=subnet or None,
             sort=sort, direction=direction,
@@ -502,7 +503,7 @@ def reservations6_export() -> Response:
     q = (request.values.get("q") or "").strip() or None
     subnet = (request.values.get("subnet") or "").strip() or None
     _, sort, direction = _pagination_params()
-    app_config = dict(current_app.config)
+    app_config = config_snapshot(current_app.config)
 
     def rows():
         conn = state_index.connect(app_config["STATE_INDEX_DB"])
@@ -707,6 +708,10 @@ def leases6() -> str:
     """Search/filter/sort the DHCPv6 lease table (IA_NA/IA_TA/IA_PD) via the
     state index. Covers every lease currently in the file, not just active
     ones -- see core/state_index.py's module docstring."""
+    # Remote endpoints pull their table on demand (lease6-get-all).
+    for warning in ensure_leases("6"):
+        flash(warning, "warning")
+
     q = (request.values.get("q") or "").strip()
     status = (request.values.get("status") or "").strip() or None
     subnet = (request.values.get("subnet") or "").strip() or None
@@ -725,7 +730,7 @@ def leases6() -> str:
 
     conn = state_index.connect(current_app.config["STATE_INDEX_DB"])
     try:
-        state_index.ingest_all(dict(current_app.config), conn, kinds=["lease6"])
+        state_index.ingest_all(config_snapshot(current_app.config), conn, kinds=["lease6"])
         result = state_index.search_lease6(
             conn, q=q or None, status=status, subnet=subnet, lease_type=lease_type, start=start, end=end,
             sort=sort, direction=direction,
@@ -778,7 +783,7 @@ def leases6_export() -> Response:
         request.values.get("range", ""), request.values.get("start", ""), request.values.get("end", "")
     )
     _, sort, direction = _pagination_params()
-    app_config = dict(current_app.config)
+    app_config = config_snapshot(current_app.config)
 
     def rows():
         conn = state_index.connect(app_config["STATE_INDEX_DB"])

@@ -19,7 +19,7 @@ from ..core.ha_manager import (
     find_ha_hook, get_ha_params, set_ha_config, remove_ha_config, parse_ha_form,
     DEFAULT_HA_LIBRARY_PATH,
 )
-from ..core.kea_ctrl import send_command, find_unix_socket_path, ControlChannelError
+from ..core.kea_ctrl import send_command_any, ControlChannelError
 
 ha_bp = Blueprint('ha', __name__)
 
@@ -83,9 +83,19 @@ def save_ha_config6() -> Response:
 
 def _ha_status_response(config_file: str, dhcp_key: str) -> Response:
     config = load_json(config_file, default=_DEFAULT_KEA6_CONFIG if dhcp_key == "Dhcp6" else None)
-    socket_path = find_unix_socket_path(config, dhcp_key)
+    # Whichever control channel the daemon exposes: a heartbeat is a plain
+    # parameterless command, so HTTP serves it exactly as the UNIX socket does.
+    # Per version: the two daemons cannot share an address/port pair.
+    http_url_key = "KEA_HTTP_URL6" if dhcp_key == "Dhcp6" else "KEA_HTTP_URL"
+    http_endpoint = str(current_app.config.get(http_url_key, "") or "").strip()
+    http_user = str(current_app.config.get("KEA_HTTP_USER", "") or "")
+    http_password = str(current_app.config.get("KEA_HTTP_PASSWORD", "") or "")
+    http_auth = (http_user, http_password) if http_user and http_password else None
     try:
-        response = send_command(socket_path, "ha-heartbeat")
+        response = send_command_any(
+            config, dhcp_key, "ha-heartbeat",
+            http_endpoint=http_endpoint, http_auth=http_auth,
+        )
     except ControlChannelError as e:
         return jsonify({"error": str(e)}), 502
 

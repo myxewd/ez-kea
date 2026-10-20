@@ -33,6 +33,8 @@ _DEFAULTS: Dict[str, str] = {
     "dhcp6_log_file_in_container":    "",
     "kea_reload_strategy":           "keactrl",
     "kea_docker_container":          "",
+    "dhcp_http_url":                 "",
+    "dhcp6_http_url":                "",
 }
 
 
@@ -98,6 +100,8 @@ def apply_settings_to_app(app: Flask) -> None:
         "DHCP6_LOG_FILE":    ("dhcp6_log_file",    "./data/kea-dhcp6.log"),
         "KEA_RELOAD_STRATEGY":  ("kea_reload_strategy",  "keactrl"),
         "KEA_DOCKER_CONTAINER": ("kea_docker_container", ""),
+        "KEA_HTTP_URL":         ("dhcp_http_url",        ""),
+        "KEA_HTTP_URL6":        ("dhcp6_http_url",       ""),
         # DHCP_CONFIG_FILE_IN_CONTAINER/DHCP_LOG_FILE_IN_CONTAINER (and their
         # v6 equivalents) are handled separately below since their "unset"
         # default is the dynamic host path, not a fixed literal.

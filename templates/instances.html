@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}Kea Endpoints — EZ-KEA{% endblock %}
+{% block content %}
+<div class="page-header"><h1><i data-lucide="server"></i> Kea Endpoints</h1></div>
+
+<div class="card" style="margin-bottom:1.5rem;">
+  <div class="card-header"><h2>Registered Endpoints</h2></div>
+  <div class="card-body" style="padding:0;">
+    <table style="width:100%;border-collapse:collapse;">
+      <thead><tr style="border-bottom:1px solid rgba(255,255,255,0.1);">
+        <th style="padding:0.75rem 1rem;text-align:left;">Name</th>
+        <th style="padding:0.75rem 1rem;text-align:left;">Kind</th>
+        <th style="padding:0.75rem 1rem;text-align:left;">Where it points</th>
+        <th style="padding:0.75rem 1rem;text-align:left;">Actions</th>
+      </tr></thead>
+      <tbody>
+      {% if kea_local_present %}
+      <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
+        <td style="padding:0.75rem 1rem;">This installation</td>
+        <td style="padding:0.75rem 1rem;">local</td>
+        <td style="padding:0.75rem 1rem;font-family:var(--font-mono);font-size:0.8rem;">
+          {{ default_config_file or '—' }}
+          {% if default_http_url %}<br>{{ default_http_url }}{% endif %}
+        </td>
+        <td style="padding:0.75rem 1rem;">
+          {% if not active_id %}<span class="text-secondary" style="font-size:0.8rem;">active</span>
+          {% else %}
+          <form method="POST" action="{{ url_for('main.instances.select_instance') }}" style="display:inline;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="instance_id" value="default">
+            <button type="submit" class="btn btn-outline" style="font-size:0.8rem;padding:0.3rem 0.6rem;">Select</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endif %}
+      {% for inst in instances %}
+      <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
+        <td style="padding:0.75rem 1rem;">{{ inst.name }}</td>
+        <td style="padding:0.75rem 1rem;">{{ inst.mode }}</td>
+        <td style="padding:0.75rem 1rem;font-family:var(--font-mono);font-size:0.8rem;">{{ describe(inst) }}</td>
+        <td style="padding:0.75rem 1rem;display:flex;gap:0.5rem;flex-wrap:wrap;">
+          {% if active_id == inst.id %}
+          <span class="text-secondary" style="font-size:0.8rem;align-self:center;">active</span>
+          {% else %}
+          <form method="POST" action="{{ url_for('main.instances.select_instance') }}" style="display:inline;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="instance_id" value="{{ inst.id }}">
+            <button type="submit" class="btn btn-primary" style="font-size:0.8rem;padding:0.3rem 0.6rem;">Select</button>
+          </form>
+          {% endif %}
+          {% if inst.mode == 'http' %}
+          <form method="POST" action="{{ url_for('main.instances.pull_instance', instance_id=inst.id) }}" style="display:inline;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn-outline" style="font-size:0.8rem;padding:0.3rem 0.6rem;" title="config-get from the daemon in memory">Pull config</button>
+          </form>
+          {% endif %}
+          <form method="POST" action="{{ url_for('main.instances.delete_instance', instance_id=inst.id) }}" style="display:inline;"
+                onsubmit="return confirm('Remove endpoint {{ inst.name }}? Its local mirror stays on disk.')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn-outline" style="font-size:0.8rem;padding:0.3rem 0.6rem;border-color:rgba(239,68,68,0.4);color:#ef4444;">Remove</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><h2>Add an Endpoint</h2></div>
+  <div class="card-body">
+    <p class="text-secondary" style="font-size:0.85rem;margin-top:0;">
+      A <strong>local</strong> endpoint is a Kea host EZ-KEA can read files on (the daemon's own
+      config). An <strong>HTTP</strong> endpoint is a daemon exposing its control socket over
+      HTTP/HTTPS: EZ-KEA pulls the running configuration with <code>config-get</code> into a local
+      mirror, every page shows that mirror, and Apply pushes it back with
+      <code>config-test</code> → <code>config-set</code>.
+    </p>
+    <form method="POST" action="{{ url_for('main.instances.add_instance') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;margin-bottom:1rem;">
+        <div class="form-group" style="margin-bottom:0;">
+          <label class="form-label" for="inst-name">Name</label>
+          <input class="form-control" id="inst-name" name="name" type="text" required placeholder="core-dhcp-1">
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label class="form-label" for="inst-mode">Kind</label>
+          <select class="form-control" id="inst-mode" name="mode" onchange="updateInstanceFields()">
+            <option value="local">local — edit this host's Kea files</option>
+            <option value="http">HTTP — pull/push over the daemon's control channel</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="local-fields" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1rem;margin-bottom:1rem;">
+        <div class="form-group" style="margin-bottom:0;">
+          <label class="form-label" for="inst-cfg4">DHCPv4 config file</label>
+          <input class="form-control" id="inst-cfg4" name="dhcp4_config_file" type="text" placeholder="/etc/kea/kea-dhcp4.conf">
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label class="form-label" for="inst-cfg6">DHCPv6 config file <span class="text-secondary" style="font-size:0.8rem;">(optional)</span></label>
+          <input class="form-control" id="inst-cfg6" name="dhcp6_config_file" type="text" placeholder="/etc/kea/kea-dhcp6.conf">
+        </div>
+      </div>
+
+      <div id="http-fields" style="display:none;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1rem;margin-bottom:1rem;">
+          <div class="form-group" style="margin-bottom:0;">
+            <label class="form-label" for="inst-url4">DHCPv4 control URL</label>
+            <input class="form-control" id="inst-url4" name="http_url" type="text" placeholder="http://10.0.0.5:8000/">
+          </div>
+          <div class="form-group" style="margin-bottom:0;">
+            <label class="form-label" for="inst-url6">DHCPv6 control URL <span class="text-secondary" style="font-size:0.8rem;">(optional)</span></label>
+            <input class="form-control" id="inst-url6" name="http_url6" type="text" placeholder="http://10.0.0.5:8001/">
+          </div>
+          <div class="form-group" style="margin-bottom:0;">
+            <label class="form-label" for="inst-user">Basic auth user <span class="text-secondary" style="font-size:0.8rem;">(optional)</span></label>
+            <input class="form-control" id="inst-user" name="http_user" type="text" autocomplete="off">
+          </div>
+          <div class="form-group" style="margin-bottom:0;">
+            <label class="form-label" for="inst-pass">Basic auth password</label>
+            <input class="form-control" id="inst-pass" name="http_password" type="password" autocomplete="new-password">
+          </div>
+        </div>
+      </div>
+
+      <button type="submit" class="btn btn-primary"><i data-lucide="plus"></i> Add Endpoint</button>
+    </form>
+  </div>
+</div>
+
+<script>
+function updateInstanceFields() {
+  var http = document.getElementById('inst-mode').value === 'http';
+  document.getElementById('http-fields').style.display = http ? '' : 'none';
+  document.getElementById('local-fields').style.display = http ? 'none' : '';
+}
+document.addEventListener('DOMContentLoaded', updateInstanceFields);
+</script>
+{% endblock %}

@@ -1,0 +1,102 @@
+# deploy/docker-compose.yml - two containers, one Kea config file.
+#
+#   ezkea   the web UI. The only process that ever writes /etc/kea.
+#   kea     the DHCP daemon. Reads the same file, read-only, and is reloaded
+#           by the UI over its own UNIX control socket.
+#
+# Typical deployment (the full walk-through is docs/deployment.md):
+#
+#   # 1. once, on this host
+#   mkdir -p /opt/ez-kea/{data,kea/conf,kea/lib,kea/run,kea/log/kea}
+#   cp kea.env.example kea.env        # then edit it, at minimum SECRET_KEY
+#
+#   # 2. build the image (see ../ezkea/Dockerfile for the arguments)
+#   docker build -t ez-kea:0.10.1 \
+#     --build-arg EZK_REF=v0.10.1 ../ezkea
+#
+#   # 3. create the config the daemon loads (see docs/deployment.md, step 5)
+#   cp ../init/kea-dhcp4.conf /opt/ez-kea/kea/conf/kea-dhcp4.conf
+#
+#   # 4. start
+#   docker compose --env-file kea.env up -d
+#
+# Every option is spelled out rather than left to a default: Kea publishes no
+# ports, and its control socket sits in its own mount so nothing that does not
+# need it can reach it.
+name: ez-kea
+
+services:
+  ezkea:
+    image: ez-kea:0.10.1
+    container_name: ez-kea
+    restart: unless-stopped
+    depends_on:
+      - kea
+    ports:
+      # Bound to a specific host address, not 0.0.0.0: the UI is the way into
+      # your DHCP configuration. Put nginx or Caddy in front of it.
+      - "${EZ_KEA_BIND:-127.0.0.1}:${EZ_KEA_PORT:-8080}:8080"
+    env_file:
+      - kea.env
+    environment:
+      # -- where the Kea files are, as seen from THIS container -------------
+      # Plain in-container paths. Both containers mount the same host
+      # directories at the same absolute paths, so there is no host-path vs
+      # in-container-path translation to configure, and
+      # DHCP_CONFIG_FILE_IN_CONTAINER therefore stays empty on purpose.
+      DHCP_CONFIG_FILE: /etc/kea/kea-dhcp4.conf
+      DHCP_CONFIG_FILE_IN_CONTAINER: ""
+      DHCP_LEASES_FILE: /var/lib/kea/kea-leases4.csv
+      DHCP_LOG_FILE: /var/log/kea/kea-dhcp4.log
+      DHCP_LOG_FILE_IN_CONTAINER: ""
+      DHCP6_CONFIG_FILE: /data/kea-dhcp6.conf
+      DHCP6_LEASES_FILE: /data/kea-leases6.csv
+      DHCP6_LOG_FILE: /data/kea-dhcp6.log
+      # -- this container's own state ----------------------------------------
+      DATABASE_URL: sqlite:////data/ez-kea.db
+      SETTINGS_FILE: /data/ez-kea-settings.json
+      LOG_INDEX_DB: /data/ez-kea-logindex.db
+      STATE_INDEX_DB: /data/ez-kea-stateindex.db
+      BACKUP_DIR: /data/backups
+      HOST: 0.0.0.0
+      PORT: "8080"
+      # -- how EZ-KEA talks to the daemon ------------------------------------
+      KEA_DHCP4_CMD: kea-dhcp4
+      KEA_DHCP6_CMD: kea-dhcp6
+      # Every save is handed to `kea-dhcp4 -t` before it is kept, which is
+      # what makes the config check real rather than a form-level guess.
+      KEA_CTRL_CMD: keactrl
+      KEA_RELOAD_STRATEGY: ${KEA_RELOAD_STRATEGY:-control-socket}
+    volumes:
+      # Kea's config directory. The file inside /etc/kea is the contract
+      # between the two containers and EZ-KEA rewrites it in place, so the
+      # directory is what gets mounted, not the single file.
+      - ${KEA_ROOT:-/opt/ez-kea/kea}/conf:/etc/kea:ro
+      # The same directories the daemon has, so leases, its log and -- this
+      # is the one that matters -- its control socket are visible here.
+      - ${KEA_ROOT:-/opt/ez-kea/kea}/lib:/var/lib/kea:ro
+      - ${KEA_ROOT:-/opt/ez-kea/kea}/log:/var/log/kea:ro
+      - ${KEA_ROOT:-/opt/ez-kea/kea}/run:/run/kea
+      # Accounts, app settings, backups and the two disposable search indexes.
+      - ${EZ_KEA_ROOT:-/opt/ez-kea}/data:/data
+    stop_grace_period: 20s
+
+  kea:
+    image: ${KEA_IMAGE:-ez-kea-kea:2.2.0}
+    container_name: kea
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/kea-entrypoint.sh"]
+    command: ["kea-dhcp4", "-c", "/etc/kea/kea-dhcp4.conf"]
+    # No published ports: DHCP is UDP/67 broadcast traffic that has to
+    # arrive on the host's own interface. docs/deployment.md covers running
+    # the daemon on the host instead, which is the usual production choice.
+    volumes:
+      - ${KEA_ROOT:-/opt/ez-kea/kea}/conf:/etc/kea
+      - ${KEA_ROOT:-/opt/ez-kea/kea}/lib:/var/lib/kea
+      - ${KEA_ROOT:-/opt/ez-kea/kea}/log:/var/log/kea
+      - ${KEA_ROOT:-/opt/ez-kea/kea}/run:/run/kea
+    healthcheck:
+      test: ["CMD", "kea-dhcp4", "-t", "/etc/kea/kea-dhcp4.conf"]
+      interval: 60s
+      timeout: 10s
+      retries: 3

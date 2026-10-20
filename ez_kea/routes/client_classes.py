@@ -18,6 +18,7 @@ from werkzeug.wrappers import Response
 from ..core import client_class as cc
 from ..core.config_manager import _DEFAULT_KEA6_CONFIG, load_json, save_kea_config, with_config_lock
 from ..core.config_validate import InvalidConfigError, save_validated_kea_config
+from ..core.instances import config_snapshot
 
 client_classes_bp = Blueprint('client_classes', __name__)
 
@@ -220,7 +221,7 @@ def _save(version: str) -> Union[Response, Tuple[str, int]]:
     try:
         warning = save_validated_kea_config(
             config, config_file, current_app.config["BACKUP_DIR"],
-            dict(current_app.config), dhcp_key=daemon["root_key"],
+            config_snapshot(current_app.config), dhcp_key=daemon["root_key"],
         )
     except InvalidConfigError as e:
         return render_template(

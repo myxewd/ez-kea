@@ -4,6 +4,7 @@
 import os
 from typing import Any
 from flask import Flask
+from flask.config import Config as _FlaskConfig
 from flask_wtf import CSRFProtect
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager
@@ -18,6 +19,41 @@ login_manager.login_message = "Please log in to access EZ-KEA."
 login_manager.login_message_category = "error"
 
 
+class InstanceScopedConfig(_FlaskConfig):
+    """
+    Flask's config, with one addition: reads can be overridden per request by
+    the Kea endpoint selected in the navbar.
+
+    EZ-KEA's routes read their config file paths, commands and control endpoint
+    out of current_app.config. Making those per-endpoint by rewriting
+    app.config would be a data race -- waitress serves requests in threads, so
+    two operators looking at two Kea servers would clobber each other. Putting
+    the override on flask.g instead keeps it request-local, and every existing
+    route picks it up without knowing endpoints exist.
+    """
+
+    def _override(self):
+        try:
+            from flask import g, has_app_context
+        except Exception:  # pragma: no cover - flask is a hard dependency
+            return None
+        if not has_app_context():
+            return None
+        return getattr(g, "instance_overrides", None)
+
+    def __getitem__(self, key):
+        override = self._override()
+        if override is not None and key in override:
+            return override[key]
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        override = self._override()
+        if override is not None and key in override:
+            return override[key]
+        return super().get(key, default)
+
+
 def create_app(config_class: Any = Config, config_overrides: dict | None = None) -> Flask:
     """
     Application factory. Creates and configures the Flask app, initialises
@@ -30,6 +66,11 @@ def create_app(config_class: Any = Config, config_overrides: dict | None = None)
     is too late for those, since they execute inside this function.
     """
     app = Flask(__name__, template_folder='../templates', static_folder='../static')
+    # Replace the plain Config before anything is loaded into it, so every
+    # later read (including from extensions) goes through the instance scope.
+    # Seed it from the defaults Flask just created (DEBUG, TESTING, ...) so
+    # replacing the object loses nothing but gains the per-request scope.
+    app.config = InstanceScopedConfig(app.root_path, dict(app.config))
     app.config.from_object(config_class)
     if config_overrides:
         app.config.update(config_overrides)
@@ -61,6 +102,10 @@ def create_app(config_class: Any = Config, config_overrides: dict | None = None)
     from .core.discovery import discover_environment, discover_environment6
     env_info = discover_environment(app.config)
     app.config["EZ-KEA_MODE"] = env_info["mode"]
+    # Whether this installation actually has a local Kea to manage. A standalone
+    # EZ-KEA (managing only remote endpoints) has none, and must not offer a
+    # "This installation" entry that would point at an empty sandbox file.
+    app.config["LOCAL_KEA4_PRESENT"] = env_info["mode"] == "LIVE"
     if "dhcp_config_file" in env_info:
         app.config["DHCP_CONFIG_FILE"] = env_info["dhcp_config_file"]
         app.config["KEA_DHCP4_CMD"]    = env_info["kea_dhcp4_cmd"]
@@ -75,6 +120,7 @@ def create_app(config_class: Any = Config, config_overrides: dict | None = None)
 
     env6_info = discover_environment6(app.config)
     app.config["EZ-KEA6_MODE"] = env6_info["mode"]
+    app.config["LOCAL_KEA6_PRESENT"] = env6_info["mode"] == "LIVE"
     if "dhcp6_config_file" in env6_info:
         app.config["DHCP6_CONFIG_FILE"] = env6_info["dhcp6_config_file"]
         app.config["KEA_DHCP6_CMD"]     = env6_info["kea_dhcp6_cmd"]
@@ -123,6 +169,55 @@ def create_app(config_class: Any = Config, config_overrides: dict | None = None)
 
     from .auth import auth_bp
     app.register_blueprint(auth_bp)
+
+    # ── Multi-endpoint support ───────────────────────────────────────────
+    # Resolve the navbar selection onto flask.g for each request, which is what
+    # InstanceScopedConfig reads. Static files skip it: they never touch Kea.
+    @app.before_request
+    def _resolve_kea_instance() -> None:
+        from flask import flash, redirect, request, url_for
+        from .core.instances import apply_selected_instance, feature_block_reason
+
+        if request.endpoint == "static":
+            return
+        apply_selected_instance()
+
+        # Hiding a nav link is presentation; this is the guarantee. A stale tab
+        # or a bookmark must not render a page whose data does not exist for the
+        # selected endpoint (remote logs, an endpoint with no DHCPv6 side).
+        reason = feature_block_reason(request.endpoint, request.view_args)
+        if reason:
+            if request.path.startswith("/api/"):
+                from flask import jsonify
+                return jsonify({"error": reason}), 404
+            flash(reason, "warning")
+            return redirect(url_for("main.system.index"))
+
+    @app.context_processor
+    def inject_kea_instances():
+        """The navbar dropdown needs every registered endpoint on every page."""
+        from flask import g
+        from flask_login import current_user
+        from .core.instances import all_instances
+        registered = []
+        if getattr(current_user, "is_authenticated", False):
+            try:
+                registered = all_instances()
+            except Exception:
+                # An unreadable registry must not take down the login prompt or
+                # any page that happens to render while the DB is being created.
+                registered = []
+        from .core.instances import capabilities_for
+        return {
+            "kea_instances": registered,
+            "kea_active_instance": getattr(g, "kea_instance", None),
+            # What the navbar may offer for the active endpoint (IPv6 side,
+            # log/lease pages, file-based settings).
+            "kea_features": capabilities_for(getattr(g, "kea_instance", None)),
+            "kea_local_present": bool(
+                app.config.get("LOCAL_KEA4_PRESENT") or app.config.get("LOCAL_KEA6_PRESENT")
+            ),
+        }
 
     # A Kea config that exists but cannot be read or backed up is an operator
     # problem with a specific fix, not a crash. Without these, both surfaced as
