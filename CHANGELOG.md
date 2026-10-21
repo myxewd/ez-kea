@@ -1,7 +1,9 @@
 # Changelog
 
 Notable changes to EZ-KEA. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with an
+optional fourth component as a hotfix counter (0.10.2 -> 0.10.2.1) when a release
+needs re-cutting without changing the announced one.
 
 While EZ-KEA is on `0.x`, environment variable names, settings keys, and the
 on-disk layout under `data/` may still change between releases. Your Kea
@@ -9,6 +11,22 @@ configuration is never one of those things — EZ-KEA edits the file Kea already
 reads and always backs it up first.
 
 ## [Unreleased]
+
+## [0.10.2.1] — 2026-10-21
+
+### Added
+
+- **`scripts/version_bump.py` cuts a release without letting the copies of the
+  version drift apart.** The version lives in `ez_kea/__about__.py` and the UI
+  renders it from there, but the compose image tag, the Dockerfile and
+  documentation examples, the changelog heading and compare links, and the git
+  tag are all written by hand — and missing one is how a release ships a panel
+  that says 0.10.2.1 while `docker compose up -d` still pulls 0.10.2. The
+  script rewrites every anchor in one pass, refuses to start when one of them
+  has moved, checks the result (the version guard included, and the contents of
+  the image it just built when `--docker` is used), then commits, tags and
+  pushes. `--check` reports a tree whose anchors disagree; `--dry-run` prints
+  the whole release without touching anything. See `docs/releasing.md`.
 
 ### Fixed
 
@@ -428,7 +446,8 @@ version on it so an install can be identified.
   note and nothing more.
 - Branding standardized on EZ-KEA.
 
-[Unreleased]: https://github.com/fenleytech/ez-kea/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/fenleytech/ez-kea/compare/v0.10.2.1...HEAD
+[0.10.2.1]: https://github.com/fenleytech/ez-kea/compare/v0.10.2...v0.10.2.1
 [0.10.2]: https://github.com/fenleytech/ez-kea/compare/v0.9.2...v0.10.2
 [0.9.2]: https://github.com/fenleytech/ez-kea/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/fenleytech/ez-kea/compare/v0.9.0...v0.9.1
