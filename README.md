@@ -84,7 +84,7 @@ shared config directory:
 
 ```bash
 cd deploy
-docker build -t ez-kea:0.10.2.1 --build-arg EZK_REF=v0.10.2.1 ./ezkea
+docker build -t ez-kea:0.10.2.2 --build-arg EZK_REF=v0.10.2.2 ./ezkea
 docker build -t ez-kea-kea:2.2.0 ./kea
 cp kea.env.example kea.env      # set SECRET_KEY
 docker compose --env-file kea.env up -d

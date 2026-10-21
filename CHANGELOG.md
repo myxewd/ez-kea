@@ -12,6 +12,39 @@ reads and always backs it up first.
 
 ## [Unreleased]
 
+## [0.10.2.2] — 2026-10-21
+
+### Added
+
+- **The release script now proves the image it built actually starts.** A
+  successful `docker build` says nothing about whether the container comes up,
+  and the 0.10.2.1 image was published without anyone noticing that it could not
+  be stopped. `version_bump.py --docker` now runs the new image, waits for
+  `/healthz`, then stops it and requires exit code 0 in under a second, before
+  the push. `--no-smoke` skips the check.
+
+### Fixed
+
+- **The container stops when it is told to, and says what it is doing.** In the
+  image the app is PID 1, and the kernel ignores the default action of a signal
+  for PID 1 -- so the SIGTERM that `docker stop`, `docker compose down` and
+  every `up --force-recreate` sends was silently dropped. Each stop waited out
+  the whole grace period, was SIGKILLed, and reported **exit code 137**, which is
+  indistinguishable from a crash; a recreate took ~23s, and a Ctrl+C during that
+  window left a dead container behind. `app.py` now installs a SIGTERM handler,
+  so a stop finishes in under a second with exit code 0. It also prints one
+  startup line with the version and the address it bound: waitress only logs its
+  "Serving on" at INFO and leaves the root logger at WARNING, so a perfectly
+  healthy container produced **no output at all**, and an empty `docker logs`
+  could not be told apart from a silent failure.
+
+- **The container runs as the account the image creates.** `entrypoint.sh`
+  chowned `/data` and `/run/kea` for uid 10001 and then `exec`'d the app as
+  root, so everything it wrote into the mounted volume came out root-owned and a
+  deployment that really was 10001 could not touch those files afterwards. It
+  now drops to `EZKEA_UID`/`EZKEA_GID` with `setpriv` (already in the base
+  image) and sets `HOME=/data`, which is the ownership model the docs describe.
+
 ## [0.10.2.1] — 2026-10-21
 
 ### Added
@@ -446,7 +479,8 @@ version on it so an install can be identified.
   note and nothing more.
 - Branding standardized on EZ-KEA.
 
-[Unreleased]: https://github.com/fenleytech/ez-kea/compare/v0.10.2.1...HEAD
+[Unreleased]: https://github.com/fenleytech/ez-kea/compare/v0.10.2.2...HEAD
+[0.10.2.2]: https://github.com/fenleytech/ez-kea/compare/v0.10.2.1...v0.10.2.2
 [0.10.2.1]: https://github.com/fenleytech/ez-kea/compare/v0.10.2...v0.10.2.1
 [0.10.2]: https://github.com/fenleytech/ez-kea/compare/v0.9.2...v0.10.2
 [0.9.2]: https://github.com/fenleytech/ez-kea/compare/v0.9.1...v0.9.2
