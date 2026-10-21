@@ -12,6 +12,17 @@ reads and always backs it up first.
 
 ### Fixed
 
+- **Pulling a remote endpoint no longer discards edits that were made in
+  EZ-KEA but not applied yet.** A daemon restart throws away its in-memory
+  configuration, so the next `config-get` reports the older file; replacing the
+  mirror with that would silently drop the operator's pending change. Pull is
+  now the same three-way merge Apply uses: the daemon's current document comes
+  in as the remote side, the edits made here survive, and the freshly pulled
+  document becomes the baseline Apply replays them onto. A setting changed on
+  both sides is reported by path and the pull is declined with the local copy
+  untouched; a "discard my edits" checkbox on the Endpoints page takes the
+  daemon's copy on request (the replaced copy is backed up first).
+
 - **Applying to a remote endpoint no longer overwrites everything else that
   endpoint is running.** `config-set` replaces the daemon's entire running
   configuration, while the mirror Apply pushed was only as fresh as the last

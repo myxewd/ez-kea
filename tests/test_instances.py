@@ -724,3 +724,136 @@ def test_changing_an_endpoints_url_invalidates_its_merge_baseline(app, client):
                                   http_user="", http_password="")
         assert instances.merge_base(instance, "4") is None
 
+# ── pulling: the daemon's changes arrive, unapplied edits stay ──────────────
+#
+# A restart throws away a remote daemon's in-memory configuration, so a pull
+# after one reports the older file. Pull is therefore a merge, not a replace:
+# it brings in what the daemon says and keeps what this installation has not
+# applied yet, with the freshly pulled document becoming the new baseline.
+
+
+def test_pull_keeps_edits_that_were_not_applied_yet(app, client):
+    from ez_kea.core import instances
+
+    pulled = {"Dhcp4": {
+        "valid-lifetime": 6000,
+        "subnet4": [{"id": 1, "subnet": "192.0.2.0/24",
+                     "pools": [{"pool": "192.0.2.10 - 192.0.2.20"}]}],
+    }}
+    # After a restart the daemon runs its file again: the in-memory value is
+    # gone, which is exactly the case where a naive pull would clobber the
+    # operator's pending edit.
+    after_restart = {"Dhcp4": {
+        "valid-lifetime": 4000,
+        "subnet4": [{"id": 1, "subnet": "192.0.2.0/24",
+                     "pools": [{"pool": "192.0.2.10 - 192.0.2.20"}]}],
+    }}
+    with fake_kea_http(
+        {"result": 0, "arguments": dict(pulled, hash="A")},
+        {"result": 0, "arguments": dict(after_restart, hash="B")},
+    ) as (endpoint, _):
+        _add_http_instance(client, http_url=endpoint)
+        with app.app_context():
+            [instance] = instances.all_instances()
+            paths = instances.mirror_paths(instance)
+            mirror = json.load(open(paths["4"]))
+            mirror["Dhcp4"]["subnet4"][0]["pools"] = [{"pool": "192.0.2.100 - 192.0.2.120"}]
+            with open(paths["4"], "w") as handle:
+                json.dump(mirror, handle)
+            instance_id = instance.id
+
+        response = client.post("/instances/%d/pull" % instance_id,
+                               data={}, follow_redirects=True)
+        assert response.status_code == 200
+
+        with app.app_context():
+            [instance] = instances.all_instances()
+            paths = instances.mirror_paths(instance)
+            mirrored = json.load(open(paths["4"]))
+            baseline = json.load(open(paths["base4"]))
+
+    body = response.get_data(as_text=True)
+    assert "kept the edits this installation had not applied yet" in body
+    # The daemon's current value came in...
+    assert mirrored["Dhcp4"]["valid-lifetime"] == 4000
+    # ...the unapplied edit survived...
+    assert mirrored["Dhcp4"]["subnet4"][0]["pools"] == [{"pool": "192.0.2.100 - 192.0.2.120"}]
+    # ...and the newly pulled document is what Apply will replay it onto.
+    assert baseline == after_restart
+
+
+def test_pull_refuses_when_edits_conflict_with_the_daemon(app, client):
+    from ez_kea.core import instances
+
+    pulled = {"Dhcp4": {"subnet4": [{"id": 1, "subnet": "192.0.2.0/24",
+                                     "pools": [{"pool": "192.0.2.10 - 192.0.2.20"}]}]}}
+    daemon_now = {"Dhcp4": {"subnet4": [{"id": 1, "subnet": "192.0.2.0/24",
+                                          "pools": [{"pool": "192.0.2.30 - 192.0.2.40"}]}]}}
+    with fake_kea_http(
+        {"result": 0, "arguments": dict(pulled, hash="A")},
+        {"result": 0, "arguments": dict(daemon_now, hash="B")},
+    ) as (endpoint, _):
+        _add_http_instance(client, http_url=endpoint)
+        with app.app_context():
+            [instance] = instances.all_instances()
+            paths = instances.mirror_paths(instance)
+            mirror = json.load(open(paths["4"]))
+            mirror["Dhcp4"]["subnet4"][0]["pools"] = [{"pool": "192.0.2.50 - 192.0.2.60"}]
+            with open(paths["4"], "w") as handle:
+                json.dump(mirror, handle)
+            instance_id = instance.id
+
+        response = client.post("/instances/%d/pull" % instance_id,
+                               data={}, follow_redirects=True)
+
+        with app.app_context():
+            [instance] = instances.all_instances()
+            paths = instances.mirror_paths(instance)
+            mirrored = json.load(open(paths["4"]))
+            baseline = json.load(open(paths["base4"]))
+
+    body = response.get_data(as_text=True)
+    assert "Did not pull Dhcp4" in body
+    assert "Dhcp4.subnet4[id=1].pools" in body
+    # Nothing was lost on either side: the edit and the old baseline are intact,
+    # so the operator can still reconcile and apply.
+    assert mirrored["Dhcp4"]["subnet4"][0]["pools"] == [{"pool": "192.0.2.50 - 192.0.2.60"}]
+    assert baseline == pulled
+
+
+def test_pull_can_discard_local_edits_on_request(app, client):
+    from ez_kea.core import instances
+
+    pulled = {"Dhcp4": {"subnet4": [{"id": 1, "subnet": "192.0.2.0/24",
+                                     "pools": [{"pool": "192.0.2.10 - 192.0.2.20"}]}]}}
+    daemon_now = {"Dhcp4": {"subnet4": [{"id": 1, "subnet": "192.0.2.0/24",
+                                          "pools": [{"pool": "192.0.2.30 - 192.0.2.40"}]}]}}
+    with fake_kea_http(
+        {"result": 0, "arguments": dict(pulled, hash="A")},
+        {"result": 0, "arguments": dict(daemon_now, hash="B")},
+    ) as (endpoint, _):
+        _add_http_instance(client, http_url=endpoint)
+        with app.app_context():
+            [instance] = instances.all_instances()
+            paths = instances.mirror_paths(instance)
+            mirror = json.load(open(paths["4"]))
+            mirror["Dhcp4"]["subnet4"][0]["pools"] = [{"pool": "192.0.2.50 - 192.0.2.60"}]
+            with open(paths["4"], "w") as handle:
+                json.dump(mirror, handle)
+            instance_id = instance.id
+
+        response = client.post("/instances/%d/pull" % instance_id,
+                               data={"discard": "on"}, follow_redirects=True)
+
+        with app.app_context():
+            [instance] = instances.all_instances()
+            paths = instances.mirror_paths(instance)
+            mirrored = json.load(open(paths["4"]))
+            baseline = json.load(open(paths["base4"]))
+
+    body = response.get_data(as_text=True)
+    assert "Discarded the unapplied" in body
+    assert mirrored == daemon_now
+    assert baseline == daemon_now
+
+

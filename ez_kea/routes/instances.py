@@ -186,10 +186,11 @@ def pull_instance(instance_id: int) -> Response:
         flash("That endpoint no longer exists.", "danger")
         return redirect(url_for("main.instances.instances_page"))
 
-    warnings = instances.pull_config(instance)
-    if warnings:
-        for warning in warnings:
-            flash(warning, "warning")
+    messages = instances.pull_config(
+        instance, discard_local_edits=request.form.get("discard") == "on")
+    if messages:
+        for message in messages:
+            flash(message, "warning")
     else:
         flash("Pulled the live configuration from '%s'." % instance.name, "success")
     return redirect(url_for("main.instances.instances_page"))

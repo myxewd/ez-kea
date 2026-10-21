@@ -40,6 +40,7 @@ from flask import current_app, g, has_app_context, session
 from .config_manager import (
     _DEFAULT_KEA6_CONFIG, _DEFAULT_KEA_CONFIG, copy_file, save_json,
 )
+from .config_merge import merge_documents
 
 # Session key holding the id of the selected instance. Deliberately in the
 # session rather than in a URL parameter: every link in the app would otherwise
@@ -205,6 +206,12 @@ def merge_base(instance, version: str) -> Optional[Dict[str, Any]]:
         return None
     path = mirror_paths(instance)["base4" if str(version) == "4" else "base6"]
     return _document_from_file(path)
+
+
+def _is_seeded_skeleton(document: Any, version: str) -> bool:
+    """Whether a mirror is still the untouched skeleton ensure_mirrors wrote."""
+    skeleton = _DEFAULT_KEA6_CONFIG if str(version) == "6" else _DEFAULT_KEA_CONFIG
+    return document == skeleton
 
 
 def _backup_mirror(path: str) -> None:
@@ -684,17 +691,29 @@ def describe(instance) -> str:
     return " · ".join(parts)
 
 
-def pull_config(instance) -> List[str]:
+def pull_config(instance, discard_local_edits: bool = False) -> List[str]:
     """
     Refresh an http instance's mirrors from the daemon's own configuration.
 
     Uses config-get, which returns the configuration the daemon is running
     right now -- not the file on its disk, which may differ if someone applied
-    a config-set. Returns a list of warnings (empty means everything pulled).
+    a config-set. Returns a list of messages (empty means everything pulled and
+    nothing needed saying).
 
-    A successful pull also stores the document as the endpoint's merge baseline
-    (see merge_base), which is what lets Apply replay only EZ-KEA's own edits
-    onto a daemon that changed underneath the mirror.
+    A pull is *not* allowed to throw away edits that were made here but not yet
+    applied. That matters most exactly when the daemon has been restarted: its
+    in-memory configuration is gone, so config-get now reports the (older) file
+    -- and a naive overwrite would silently replace the operator's pending
+    change with it. So the pulled document is treated as the remote side of the
+    same three-way merge Apply uses (baseline = last pull, local = mirror,
+    remote = just pulled): the unapplied delta survives, and the new pulled
+    document becomes the baseline Apply will replay it onto. A real conflict
+    leaves both the mirror and the baseline untouched and says so; pass
+    discard_local_edits=True to take the daemon's copy instead.
+
+    A successful pull also stores the pulled document as the endpoint's merge
+    baseline (see merge_base), which is what lets Apply replay only EZ-KEA's own
+    edits onto a daemon that changed underneath the mirror.
     """
     from .kea_ctrl import HTTP_CONFIG_TIMEOUT_SECONDS, ControlChannelError, send_http_command
 
@@ -704,7 +723,7 @@ def pull_config(instance) -> List[str]:
 
     paths = ensure_mirrors(instance)
     auth = (instance.http_user, instance.http_password) if instance.http_user and instance.http_password else None
-    warnings: List[str] = []
+    messages: List[str] = []
 
     for version, url, key in (("4", instance.http_url, "Dhcp4"), ("6", instance.http_url6, "Dhcp6")):
         if not url:
@@ -712,11 +731,11 @@ def pull_config(instance) -> List[str]:
         try:
             response = send_http_command(url, "config-get", timeout=HTTP_CONFIG_TIMEOUT_SECONDS, auth=auth)
         except ControlChannelError as e:
-            warnings.append("Could not pull %s from %s: %s" % (key, url, e))
+            messages.append("Could not pull %s from %s: %s" % (key, url, e))
             continue
 
         if response.get("result") != 0:
-            warnings.append("Kea at %s refused config-get: %s"
+            messages.append("Kea at %s refused config-get: %s"
                             % (url, response.get("text") or "no explanation given"))
             continue
 
@@ -728,17 +747,58 @@ def pull_config(instance) -> List[str]:
         # with no logging configured), and none of the response metadata.
         payload = document_from_arguments(arguments, version)
         if payload is None:
-            warnings.append("The configuration returned by %s has no %s section." % (url, key))
+            messages.append("The configuration returned by %s has no %s section." % (url, key))
             continue
 
         target = paths[version]
+        published = payload
+        base = merge_base(instance, version)
+        mirror = _document_from_file(target)
+        # A re-seeded skeleton is not an edit: if the mirror file was recreated
+        # while a baseline exists, taking the daemon's copy is the honest move.
+        pending_edits = (base is not None and mirror is not None
+                         and mirror != base
+                         and not _is_seeded_skeleton(mirror, version))
+        if pending_edits:
+            # There are edits here that were never applied. Merge them onto what
+            # the daemon reports now instead of replacing the mirror with it.
+            if discard_local_edits:
+                messages.append(
+                    "Discarded the unapplied %s edits in the local copy and took the "
+                    "daemon's configuration." % key)
+            else:
+                merged, conflicts = merge_documents(base, mirror, payload)
+                if conflicts:
+                    listed = ", ".join(conflicts[:10])
+                    if len(conflicts) > 10:
+                        listed += " (and %d more)" % (len(conflicts) - 10)
+                    messages.append(
+                        "Did not pull %s: your unapplied edits conflict with the daemon's "
+                        "current configuration at %s. The local copy was left exactly as it "
+                        "was; reconcile those settings (or tick 'discard my edits' and pull "
+                        "again)." % (key, listed))
+                    continue
+                published = merged
+                if merged != payload:
+                    messages.append(
+                        "Pulled %s and kept the edits this installation had not applied yet; "
+                        "Apply will replay them onto the daemon." % key)
+        elif (base is None and mirror is not None and mirror != payload
+              and not _is_seeded_skeleton(mirror, version)):
+            # No baseline: this copy predates the bookkeeping (or the endpoint
+            # URL changed), so its provenance cannot be trusted. Pull is the
+            # only way to establish one; say plainly that it replaces the copy.
+            messages.append(
+                "Replaced the local %s copy with the daemon's configuration (its previous "
+                "contents are in Backups)." % key)
+
         try:
             if os.path.isfile(target):
                 copy_file(target, current_app.config["BACKUP_DIR"])
-            save_json(payload, target)
+            save_json(published, target)
             record_pull(instance, version, url, payload,
                         config_hash=arguments.get("hash", ""))
         except Exception as e:  # permission, disk, whatever -- report, don't crash the UI
-            warnings.append("Could not write the local mirror %s: %s" % (target, e))
+            messages.append("Could not write the local mirror %s: %s" % (target, e))
 
-    return warnings
+    return messages

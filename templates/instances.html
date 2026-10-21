@@ -50,9 +50,12 @@
           </form>
           {% endif %}
           {% if inst.mode == 'http' %}
-          <form method="POST" action="{{ url_for('main.instances.pull_instance', instance_id=inst.id) }}" style="display:inline;">
+          <form method="POST" action="{{ url_for('main.instances.pull_instance', instance_id=inst.id) }}" style="display:inline-flex;align-items:center;gap:0.4rem;">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <button type="submit" class="btn btn-outline" style="font-size:0.8rem;padding:0.3rem 0.6rem;" title="config-get from the daemon in memory">Pull config</button>
+            <button type="submit" class="btn btn-outline" style="font-size:0.8rem;padding:0.3rem 0.6rem;" title="config-get from the daemon, keeping edits you have not applied yet">Pull config</button>
+            <label class="text-secondary" style="font-size:0.7rem;display:inline-flex;align-items:center;gap:0.25rem;cursor:pointer;" title="Take the daemon's configuration as-is and throw away edits you have not applied">
+              <input type="checkbox" name="discard" value="on"> discard my edits
+            </label>
           </form>
           {% endif %}
           <form method="POST" action="{{ url_for('main.instances.delete_instance', instance_id=inst.id) }}" style="display:inline;"
@@ -75,8 +78,10 @@
       A <strong>local</strong> endpoint is a Kea host EZ-KEA can read files on (the daemon's own
       config). An <strong>HTTP</strong> endpoint is a daemon exposing its control socket over
       HTTP/HTTPS: EZ-KEA pulls the running configuration with <code>config-get</code> into a local
-      mirror, every page shows that mirror, and Apply pushes it back with
-      <code>config-test</code> → <code>config-set</code>.
+      mirror, every page shows that mirror, and Apply replays the edits made here onto the
+      daemon's current configuration and pushes that with <code>config-test</code> →
+      <code>config-set</code> → <code>config-write</code>. Pulling keeps edits that have not been
+      applied yet; tick "discard my edits" to take the daemon's copy instead.
     </p>
     <form method="POST" action="{{ url_for('main.instances.add_instance') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

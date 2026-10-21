@@ -424,6 +424,16 @@ edit stays in the local copy until you reconcile the two. A local copy that was
 never successfully pulled (or that belongs to a different endpoint URL) is
 refused the same way instead of being pushed.
 
+**Pull is a merge too.** A restart throws away a remote daemon's in-memory
+configuration, so the next `config-get` reports the older file on disk. Rather
+than replacing the mirror with it and silently dropping work that has not been
+applied, **Pull config** merges the same way Apply does: what the daemon reports
+comes in, edits made here survive, and the pulled document becomes the new
+baseline. On a conflict the pull is declined and the local copy is left exactly
+as it was. Tick **discard my edits** on the Endpoints page to take the daemon's
+copy instead; the replaced copy is backed up first, so Backups/Restore can still
+bring it back.
+
 The remote endpoint's **Leases** page needs the daemon to answer `lease4-get-all`
 (`lease6-get-all` for DHCPv6). Since Kea 3.0 those commands live in the lease
 commands hook, which the daemon has to load explicitly:
