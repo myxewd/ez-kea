@@ -23,5 +23,21 @@ chown -R "${EZKEA_UID:-10001}:${EZKEA_GID:-10001}" /data 2>/dev/null || true
 # silent: the daemon starts fine and every reload fails with EPERM.
 install -d -o "${EZKEA_UID:-10001}" -g "${EZKEA_GID:-10001}" -m 0750 /run/kea
 
-# exec: the app becomes PID 1 so it receives SIGTERM directly.
+# Hand the process over to the account the build created. Without this the
+# container kept running as root while the docs, the image's own user, the
+# /data ownership and the /run/kea ownership all said 10001 -- so every file
+# the app wrote into the mounted volume came out root-owned, and the next
+# deployment that really was 10001 could not touch them.
+#
+# HOME follows the account: /root is not writable by 10001, and anything that
+# lazily creates ~/.cache would otherwise fail with EACCES.
+export HOME=/data
+
+# setpriv is util-linux, already in the base image; no extra layer to pull.
+if command -v setpriv >/dev/null 2>&1; then
+    exec setpriv --reuid="${EZKEA_UID:-10001}" --regid="${EZKEA_GID:-10001}" \
+        --clear-groups -- "$@"
+fi
+
+echo "warning: setpriv not found, staying as uid $(id -u)" >&2
 exec "$@"

@@ -19,7 +19,10 @@ from ez_kea import create_app
 from ez_kea.__about__ import __version__
 from conftest import login
 
-SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
+# Three components is SemVer; a fourth is the hotfix counter EZ-KEA uses for
+# re-cuts of a release that is already tagged (0.10.2 -> 0.10.2.1). Both are
+# accepted here so a hotfix is a one-line bump, not a test edit.
+SEMVER = re.compile(r"^\d+(?:\.\d+){2,3}(?:-[0-9A-Za-z.-]+)?$")
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
