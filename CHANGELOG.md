@@ -10,6 +10,25 @@ reads and always backs it up first.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Applying to a remote endpoint no longer overwrites everything else that
+  endpoint is running.** `config-set` replaces the daemon's entire running
+  configuration, while the mirror Apply pushed was only as fresh as the last
+  pull — so editing a subnet in EZ-KEA silently reverted anything that had
+  changed on the daemon since. The reported case: `libdhcp_lease_cmds.so` was
+  added to `hooks-libraries` by hand and the daemon reloaded; the next subnet
+  edit pushed a mirror taken before that change, unloading the hook and making
+  the Leases page fail with `'lease4-get-all' command not supported`. Apply now
+  reads the daemon's current configuration with `config-get`, replays only
+  `diff(pulled, mirror)` onto it, and pushes that — a setting changed on both
+  sides is reported by path and stops the apply with nothing pushed and the
+  local edit kept. A mirror that was never successfully pulled (still the
+  seeded skeleton) or that belongs to a different endpoint URL is refused
+  instead of being pushed, and a successful apply now also runs `config-write`
+  so the daemon's own file keeps the change across a restart, then re-reads the
+  daemon's configuration into the mirror and its merge baseline.
+
 ## [0.10.2] — 2026-10-20
 
 ### Added

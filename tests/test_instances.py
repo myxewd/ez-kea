@@ -5,6 +5,7 @@
 The multi-endpoint registry: persistence, the per-request scope switch, and
 pulling a remote daemon's live configuration into its mirror.
 """
+import copy
 import json
 
 import pytest
@@ -516,3 +517,210 @@ def test_the_endpoints_page_never_renders_the_password(app, client):
 
     body = client.get("/instances").get_data(as_text=True)
     assert "super-secret-value" not in body
+
+# ── remote apply: merge, refuse, persist ─────────────────────────────────────
+#
+# Apply used to push the mirror wholesale. config-set replaces the daemon's
+# *entire* running configuration, so a mirror taken before the operator added
+# libdhcp_lease_cmds.so silently unloaded that hook on the next subnet edit,
+# and the Leases page started failing with "lease4-get-all command not
+# supported". These pin the three parts of the fix: replay only EZ-KEA's own
+# edits onto the configuration the daemon reports now, refuse when that cannot
+# be done honestly, and write the result back to the daemon's own file.
+
+
+def test_apply_replays_local_edits_onto_the_daemons_current_config(app, client):
+    """The regression: a subnet edit after the operator enabled the lease
+    commands hook must not remove that hook."""
+    from ez_kea.core import instances
+
+    pulled = {"Dhcp4": {
+        "hooks-libraries": [],
+        "valid-lifetime": 4000,
+        "subnet4": [{"id": 1, "subnet": "192.0.2.0/24", "pools": []}],
+    }}
+    # What the daemon actually runs now: the hook was added out of band, and so
+    # was a second subnet.
+    live = copy.deepcopy(pulled)
+    live["Dhcp4"]["hooks-libraries"] = [{"library": "/usr/lib/kea/hooks/libdhcp_lease_cmds.so"}]
+    live["Dhcp4"]["subnet4"].append({"id": 2, "subnet": "198.51.100.0/24", "pools": []})
+    # What EZ-KEA edited locally: one subnet's pool.
+    applied = copy.deepcopy(live)
+    applied["Dhcp4"]["subnet4"][0]["pools"] = [{"pool": "192.0.2.10 - 192.0.2.20"}]
+
+    with fake_kea_http(
+        {"result": 0, "arguments": dict(pulled, hash="BASE")},            # add: pull
+        {"result": 0, "arguments": dict(live, hash="DAEMON")},            # apply: config-get
+        {"result": 0, "text": "Configuration seems sane."},                # config-test
+        {"result": 0, "text": "Configuration successful.",
+         "arguments": {"hash": "NEW"}},                                    # config-set
+        {"result": 0, "text": "Configuration written."},                   # config-write
+        {"result": 0, "arguments": dict(applied, hash="NEW")},             # apply: config-get
+    ) as (endpoint, requests):
+        _add_http_instance(client, http_url=endpoint)
+
+        with app.app_context():
+            [instance] = instances.all_instances()
+            paths = instances.mirror_paths(instance)
+            mirror = json.load(open(paths["4"]))
+            mirror["Dhcp4"]["subnet4"][0]["pools"] = [{"pool": "192.0.2.10 - 192.0.2.20"}]
+            with open(paths["4"], "w") as handle:
+                json.dump(mirror, handle)
+            assert instances.merge_base(instance, "4") is not None
+
+        response = client.post("/apply-config")
+        assert response.status_code == 200
+
+        with app.app_context():
+            [instance] = instances.all_instances()
+            paths = instances.mirror_paths(instance)
+            mirrored = json.load(open(paths["4"]))
+            baseline = json.load(open(paths["base4"]))
+            state = instances.pull_state(instance)
+
+    assert [request["body"]["command"] for request in requests] == [
+        "config-get", "config-get", "config-test", "config-set", "config-write", "config-get",
+    ]
+    pushed = requests[3]["body"]["arguments"]["Dhcp4"]
+    # The hook the daemon gained after the pull survives...
+    assert pushed["hooks-libraries"] == live["Dhcp4"]["hooks-libraries"]
+    # ...as does the subnet added on the daemon, plus the local pool edit.
+    assert [subnet["id"] for subnet in pushed["subnet4"]] == [1, 2]
+    assert pushed["subnet4"][0]["pools"] == [{"pool": "192.0.2.10 - 192.0.2.20"}]
+    # The config-get response metadata (the hash) is not pushed as a setting.
+    assert set(requests[3]["body"]["arguments"]) == {"Dhcp4"}
+
+    assert "config-write" in response.json["message"]
+    # After a successful apply there is no unapplied delta: both the mirror and
+    # the baseline are the configuration the daemon reports.
+    assert mirrored == applied
+    assert baseline == applied
+    assert state["4"]["hash"] == "NEW"
+
+
+def test_apply_refuses_a_local_copy_that_was_never_pulled(app, client):
+    """A mirror that is still the seeded skeleton (the first pull failed) must
+    never be pushed -- it would replace the daemon's real configuration."""
+    from ez_kea.core import instances
+
+    with fake_kea_http(
+        {"result": 1, "text": "Forbidden"},                                    # add: pull refused
+        {"result": 0, "arguments": {"Dhcp4": {"subnet4": []}, "hash": "ZZZ"}},  # apply: config-get
+    ) as (endpoint, requests):
+        _add_http_instance(client, http_url=endpoint)
+        with app.app_context():
+            [instance] = instances.all_instances()
+            assert instances.merge_base(instance, "4") is None
+        response = client.post("/apply-config")
+
+    assert response.status_code == 409
+    assert "Pull config" in response.json["error"]
+    # Only the two config-gets: nothing was pushed at all.
+    assert [request["body"]["command"] for request in requests] == ["config-get", "config-get"]
+
+
+def test_apply_adopts_a_local_copy_that_already_matches_the_daemon(app, client):
+    """A copy from before baselines existed is usable as soon as it is shown to
+    equal the daemon's configuration -- no pull needed, no edit thrown away."""
+    from ez_kea.core import instances
+
+    document = {"Dhcp4": {"valid-lifetime": 4000,
+                          "subnet4": [{"id": 1, "subnet": "192.0.2.0/24"}]}}
+    with fake_kea_http(
+        {"result": 1, "text": "Forbidden"},                                    # add: pull refused
+        {"result": 0, "arguments": dict(document, hash="AAA")},                # apply: config-get
+        {"result": 0, "text": "Configuration seems sane."},                    # config-test
+        {"result": 0, "text": "Configuration successful.",
+         "arguments": {"hash": "BBB"}},                                        # config-set
+        {"result": 0, "text": "Configuration written."},                       # config-write
+        {"result": 0, "arguments": dict(document, hash="BBB")},                # apply: config-get
+    ) as (endpoint, _):
+        _add_http_instance(client, http_url=endpoint)
+        with app.app_context():
+            [instance] = instances.all_instances()
+            with open(instances.mirror_paths(instance)["4"], "w") as handle:
+                json.dump(document, handle)
+        response = client.post("/apply-config")
+        assert response.status_code == 200
+        with app.app_context():
+            [instance] = instances.all_instances()
+            assert instances.merge_base(instance, "4") == document
+
+    assert "adopted as the merge baseline" in response.json["message"]
+
+
+def test_apply_reports_a_conflict_and_leaves_the_edit_alone(app, client):
+    """Both sides changed the same pool: refuse, push nothing, and keep the
+    unapplied edit in the mirror rather than picking a winner."""
+    from ez_kea.core import instances
+
+    pulled = {"Dhcp4": {"subnet4": [{"id": 1, "subnet": "192.0.2.0/24",
+                                      "pools": [{"pool": "192.0.2.10 - 192.0.2.20"}]}]}}
+    daemon_now = copy.deepcopy(pulled)
+    daemon_now["Dhcp4"]["subnet4"][0]["pools"] = [{"pool": "192.0.2.30 - 192.0.2.40"}]
+    local_edit = [{"pool": "192.0.2.50 - 192.0.2.60"}]
+
+    with fake_kea_http(
+        {"result": 0, "arguments": dict(pulled, hash="BASE")},
+        {"result": 0, "arguments": dict(daemon_now, hash="DAEMON")},
+    ) as (endpoint, requests):
+        _add_http_instance(client, http_url=endpoint)
+        with app.app_context():
+            [instance] = instances.all_instances()
+            paths = instances.mirror_paths(instance)
+            mirror = json.load(open(paths["4"]))
+            mirror["Dhcp4"]["subnet4"][0]["pools"] = local_edit
+            with open(paths["4"], "w") as handle:
+                json.dump(mirror, handle)
+        response = client.post("/apply-config")
+        with app.app_context():
+            [instance] = instances.all_instances()
+            mirrored = json.load(open(instances.mirror_paths(instance)["4"]))
+
+    assert response.status_code == 409
+    assert "Dhcp4.subnet4[id=1].pools" in response.json["error"]
+    assert "Nothing was pushed" in response.json["error"]
+    assert [request["body"]["command"] for request in requests] == ["config-get", "config-get"]
+    assert mirrored["Dhcp4"]["subnet4"][0]["pools"] == local_edit
+
+
+def test_a_failed_config_write_is_reported_without_undoing_the_apply(app, client):
+    """config-write makes the change survive a restart; if it fails the apply
+    itself still stands, and the operator is told the file was not updated."""
+    from ez_kea.core import instances
+
+    document = {"Dhcp4": {"valid-lifetime": 4000}}
+    with fake_kea_http(
+        {"result": 0, "arguments": dict(document, hash="BASE")},
+        {"result": 0, "arguments": dict(document, hash="BASE")},
+        {"result": 0, "text": "Configuration seems sane."},
+        {"result": 0, "text": "Configuration successful.", "arguments": {"hash": "NEW"}},
+        {"result": 1, "text": "failed to write /etc/kea/kea-dhcp4.conf"},
+        {"result": 0, "arguments": dict(document, hash="NEW")},
+    ) as (endpoint, requests):
+        _add_http_instance(client, http_url=endpoint)
+        response = client.post("/apply-config")
+
+    assert response.status_code == 200
+    assert "config-write failed" in response.json["message"]
+    assert "failed to write" in response.json["message"]
+    assert [request["body"]["command"] for request in requests][-2:] == ["config-write", "config-get"]
+
+
+def test_changing_an_endpoints_url_invalidates_its_merge_baseline(app, client):
+    """A baseline pulled from one daemon must not be merged into another."""
+    from ez_kea.core import instances
+
+    document = {"Dhcp4": {"subnet4": []}}
+    with fake_kea_http({"result": 0, "arguments": dict(document, hash="AAA")}) as (endpoint, _):
+        _add_http_instance(client, http_url=endpoint)
+
+    with app.app_context():
+        [instance] = instances.all_instances()
+        assert instances.merge_base(instance, "4") is not None
+
+        instances.update_instance(instance.id, name="edge-1",
+                                  http_url="http://kea.example.org:9000/", http_url6="",
+                                  http_user="", http_password="")
+        assert instances.merge_base(instance, "4") is None
+

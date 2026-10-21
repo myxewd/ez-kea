@@ -398,7 +398,31 @@ environment, never in a file it writes:
 
 Without those, every apply fails with `HTTP 401: Unauthorized` and the message
 says exactly that. Verified against Kea 3.2.1, including that `config-set`
-leaves the file on disk untouched (it only changes the running configuration).
+leaves the file on disk untouched (it only changes the running configuration),
+which is why an apply to a *remote* endpoint follows it with `config-write` —
+see below.
+
+#### Applying to a remote endpoint merges, it does not overwrite
+
+A remote endpoint's configuration is somebody else's daemon, reached over a
+channel that is not EZ-KEA's own file. `config-set` replaces that daemon's
+*entire* running configuration, so pushing the local mirror as-is would undo
+anything that changed on the daemon since the last pull. Apply therefore:
+
+1. reads the daemon's configuration with `config-get`;
+2. replays onto it only the changes EZ-KEA itself made since the last successful
+   pull (`diff(pulled, mirror)`), leaving every other key — hooks, control
+   sockets, lease database, subnets added elsewhere — exactly as the daemon
+   reports it;
+3. `config-test`, then `config-set`, on the merged document; and
+4. `config-write`, so the daemon's own file keeps the change and a restart does
+   not revert it.
+
+If the daemon changed the same setting EZ-KEA changed, Apply refuses: nothing is
+pushed, the daemon keeps running its previous configuration, and the unapplied
+edit stays in the local copy until you reconcile the two. A local copy that was
+never successfully pulled (or that belongs to a different endpoint URL) is
+refused the same way instead of being pushed.
 
 The remote endpoint's **Leases** page needs the daemon to answer `lease4-get-all`
 (`lease6-get-all` for DHCPv6). Since Kea 3.0 those commands live in the lease

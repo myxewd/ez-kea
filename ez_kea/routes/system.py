@@ -23,10 +23,15 @@ from ..core.config_manager import (
     with_config_lock, config_lock, bootstrap_config, bootstrap_config6, _DEFAULT_KEA6_CONFIG,
 )
 from ..core.settings_manager import load_settings, save_settings
-from ..core.instances import config_snapshot
+from ..core.instances import (
+    MODE_HTTP, active_instance, config_snapshot, document_from_arguments, merge_base,
+    record_applied,
+)
+from ..core.config_merge import merge_documents
 from ..core.security import validate_kea_command, validate_log_file_path, InvalidKeaCommandError, InvalidLogPathError
 from ..core.kea_ctrl import (
-    send_command, find_unix_socket_path, find_http_endpoint, normalize_http_endpoint,
+    HTTP_CONFIG_TIMEOUT_SECONDS, send_command, send_http_command,
+    find_unix_socket_path, find_http_endpoint, normalize_http_endpoint,
     push_config, config_document_for_push, send_command_any,
     ConfigRejectedError, ControlChannelError,
 )
@@ -616,16 +621,182 @@ def _http_endpoint_for(daemon: Dict[str, str], config: Dict[str, Any]) -> str:
     return find_http_endpoint(config, daemon["dhcp_root_key"])
 
 
+def _config_rejection_response(version: str,
+                               error: ConfigRejectedError) -> Tuple[Response, int]:
+    """The two config-test/config-set refusals, which leave different states."""
+    if error.phase == "config-test":
+        return jsonify({"error": (
+            f"Kea refused this configuration at config-test, so nothing was applied and "
+            f"the running daemon still has its previous configuration:\n\n{error.detail}\n\n"
+            "config-test is Kea's own parser judging this exact document, so its complaint "
+            f"above is what to fix. The file on disk already passed kea-dhcp{version} -t "
+            "and is unchanged."
+        )}), 500
+    return jsonify({"error": (
+        f"Kea passed config-test but refused the config-set, so this configuration is not "
+        f"running:\n\n{error.detail}\n\n"
+        "Kea keeps its previous configuration in that case; its log says whether it is "
+        "still serving. Nothing further was attempted."
+    )}), 500
+
+
+def _write_running_config(endpoint: str, auth: Optional[Tuple[str, str]]) -> Tuple[bool, str]:
+    """
+    Persist the daemon's running configuration to its own file (config-write).
+
+    config-set is memory-only, so without this the daemon's config file keeps
+    the configuration it was started with and the next restart silently reverts
+    whatever Apply just pushed. Returns (persisted, detail); a refused
+    config-write is reported, not treated as a failed apply.
+    """
+    try:
+        response = send_http_command(endpoint, "config-write",
+                                     timeout=HTTP_CONFIG_TIMEOUT_SECONDS, auth=auth)
+    except ControlChannelError as e:
+        return False, str(e)
+    if response.get("result") != 0:
+        return False, str(response.get("text") or "no explanation given")
+    return True, ""
+
+
+def _read_running_config(endpoint: str, auth: Optional[Tuple[str, str]],
+                         version: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """config-get as a mirror-shaped document, plus the daemon's config hash."""
+    response = send_http_command(endpoint, "config-get",
+                                 timeout=HTTP_CONFIG_TIMEOUT_SECONDS, auth=auth)
+    if response.get("result") != 0:
+        raise ControlChannelError(
+            "Kea refused config-get: %s" % (response.get("text") or "no explanation given"))
+    arguments = response.get("arguments") or {}
+    document = document_from_arguments(arguments, version)
+    digest = arguments.get("hash") if isinstance(arguments, dict) else None
+    return document, str(digest or "")
+
+
+def _apply_remote_endpoint(version: str, dhcp_key: str, endpoint: str,
+                           auth: Optional[Tuple[str, str]], mirror_document: Dict[str, Any],
+                           instance) -> Union[Response, Tuple[Response, int]]:
+    """
+    Apply for a remote endpoint: replay EZ-KEA's edits onto the daemon's
+    *current* configuration instead of overwriting it with the mirror.
+
+    config-set replaces the daemon's whole configuration, so pushing the mirror
+    as-is would undo everything that changed on the daemon since the last pull
+    -- an operator adding libdhcp_lease_cmds.so to hooks-libraries was silently
+    unloaded the next time a subnet was applied, which is why this exists.
+
+    The merge baseline is the document the last pull returned; diff(baseline,
+    mirror) is EZ-KEA's own change and nothing else, and it is replayed onto
+    what config-get reports now. A setting both sides changed is a conflict and
+    nothing is pushed, so an unapplied edit is never thrown away to break a tie.
+
+    Guard: with no baseline (never pulled, an old mirror from before baselines
+    existed, or an endpoint URL that changed since) EZ-KEA cannot tell its own
+    edits from the daemon's. If the mirror still equals the daemon it is simply
+    adopted as the baseline; otherwise Apply refuses and asks for a pull.
+    """
+    mirror_file = current_app.config["DHCP6_CONFIG_FILE" if version == "6" else "DHCP_CONFIG_FILE"]
+
+    # Hold the per-file lock so an edit cannot land between the merge and the
+    # write-back of the merged document.
+    with config_lock(mirror_file):
+        try:
+            live_document, _ = _read_running_config(endpoint, auth, version)
+        except ControlChannelError as e:
+            return jsonify({"error": (
+                "Could not read the daemon's running configuration before applying, so "
+                f"nothing was changed: {e}"
+            )}), 500
+        if live_document is None:
+            return jsonify({"error": (
+                f"Kea at {endpoint} returned a configuration with no {dhcp_key} section, so "
+                "there is nothing to merge this edit into."
+            )}), 500
+
+        base = merge_base(instance, version)
+        if base is None:
+            if mirror_document != live_document:
+                return jsonify({"error": (
+                    "EZ-KEA has no record of a successful pull for this endpoint's local copy "
+                    "(it may predate pull tracking, or the endpoint URL changed since), so it "
+                    "cannot tell which differences are your edits and which are the daemon's. "
+                    "Nothing was pushed. Click 'Pull config' to re-sync the endpoint, then redo "
+                    "the change; that pull replaces the local copy, and its previous contents "
+                    "are kept in Backups."
+                )}), 409
+            merged = live_document
+            merge_note = (" The local copy already matched the daemon, so it was adopted as "
+                          "the merge baseline.")
+        else:
+            merged, conflicts = merge_documents(base, mirror_document, live_document)
+            if conflicts:
+                listed = ", ".join(conflicts[:10])
+                if len(conflicts) > 10:
+                    listed += " (and %d more)" % (len(conflicts) - 10)
+                return jsonify({"error": (
+                    "Refusing to apply: the daemon changed the same settings since this "
+                    f"endpoint was last pulled: {listed}. Nothing was pushed, the daemon still "
+                    "runs its previous configuration, and your unapplied edits are still in "
+                    "the local copy. Reconcile the two -- make the local copy match the "
+                    "daemon's value for those settings, or apply your value on the daemon -- "
+                    "then apply again."
+                )}), 409
+            merge_note = ("" if live_document == base else
+                          " Changes the daemon had made since the last pull were preserved.")
+
+        document = config_document_for_push(merged, dhcp_key)
+        try:
+            response = push_config(endpoint, dhcp_key, document, auth=auth)
+        except ConfigRejectedError as e:
+            return _config_rejection_response(version, e)
+        except ControlChannelError as e:
+            return jsonify({"error": (
+                f"Could not apply the configuration over Kea's HTTP API: {e}"
+            )}), 500
+
+        persisted, write_detail = _write_running_config(endpoint, auth)
+
+        # Record what the daemon actually holds now (config-set can normalise a
+        # document), so the next Apply diffs against the truth.
+        final_document, final_hash = merged, ""
+        try:
+            reported, reported_hash = _read_running_config(endpoint, auth, version)
+            if reported is not None:
+                final_document, final_hash = reported, reported_hash
+        except ControlChannelError:
+            pass
+
+        arguments = response.get("arguments")
+        digest = str(arguments.get("hash") or "") if isinstance(arguments, dict) else ""
+        record_applied(instance, version, final_document, final_hash or digest)
+
+    message = ("Merged this endpoint's edits into the daemon's current configuration and "
+               "applied it (config-test, then config-set).")
+    message += merge_note
+    shown = (final_hash or digest)[:12]
+    if shown:
+        message += f" Kea is now running configuration {shown}."
+    if persisted:
+        message += " Wrote the running configuration back to the daemon's own file (config-write)."
+    else:
+        message += (
+            " config-write failed, so the daemon's own file was not updated and a restart "
+            f"would revert to it: {write_detail}"
+        )
+    return jsonify({"message": message})
+
+
 def _apply_config_over_http(version: str) -> Union[Response, Tuple[Response, int]]:
     """
-    Apply by pushing the on-disk document over the daemon's own HTTP control
-    channel: config-test first, config-set only if Kea accepted the test.
+    Apply over the daemon's own HTTP control channel: config-test first,
+    config-set only if Kea accepted the test.
 
     This is the one strategy that needs no reload binary, no signal and no UNIX
-    socket -- it asks the running daemon itself, and the daemon decides. The
-    document pushed is the file EZ-KEA just wrote (already checked with -t),
-    parsed and sent under the daemon's own section name, so a restart later
-    lands on the same configuration that is now running.
+    socket -- it asks the running daemon itself, and the daemon decides. For a
+    *local* installation the document pushed is the file EZ-KEA just wrote
+    (already checked with -t). For a selected remote endpoint the file is only
+    a mirror, so the push is the merge described in _apply_remote_endpoint:
+    only EZ-KEA's own edits are replayed, never the whole stale copy.
 
     config-test is Kea's own check on that exact document, but the ARM is
     explicit that it does not actually load the configuration, so a refused
@@ -652,26 +823,15 @@ def _apply_config_over_http(version: str) -> Union[Response, Tuple[Response, int
                      "applying."
         }), 500
 
+    instance = active_instance()
+    if instance is not None and instance.mode == MODE_HTTP:
+        return _apply_remote_endpoint(version, dhcp_key, endpoint, auth, config, instance)
+
     try:
         document = config_document_for_push(config, dhcp_key)
         response = push_config(endpoint, dhcp_key, document, auth=auth)
     except ConfigRejectedError as e:
-        # Two different failures, because they leave the daemon in different
-        # states and need different fixes.
-        if e.phase == "config-test":
-            return jsonify({"error": (
-                f"Kea refused this configuration at config-test, so nothing was applied and "
-                f"the running daemon still has its previous configuration:\n\n{e.detail}\n\n"
-                "config-test is Kea's own parser judging this exact document, so its complaint "
-                f"above is what to fix. The file on disk already passed kea-dhcp{version} -t "
-                "and is unchanged."
-            )}), 500
-        return jsonify({"error": (
-            f"Kea passed config-test but refused the config-set, so this configuration is not "
-            f"running:\n\n{e.detail}\n\n"
-            "Kea keeps its previous configuration in that case; its log says whether it is "
-            "still serving. Nothing further was attempted."
-        )}), 500
+        return _config_rejection_response(version, e)
     except ControlChannelError as e:
         return jsonify({"error": f"Could not apply the configuration over Kea's HTTP API: {e}"}), 500
 

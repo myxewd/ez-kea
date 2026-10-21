@@ -308,11 +308,15 @@ def test_send_http_command_posts_json_and_unwraps_the_list_wrapper():
 
 def test_send_http_command_rejects_non_allowlisted_command():
     from ez_kea.core.kea_ctrl import ControlChannelError
-    for forbidden in ("shutdown", "lease4-wipe", "config-write", "list-commands"):
+    for forbidden in ("shutdown", "lease4-wipe", "list-commands"):
         assert forbidden not in ALLOWED_HTTP_COMMANDS
     # config-get is allowlisted on purpose: pulling a selected endpoint's live
     # configuration into its local mirror is the multi-endpoint read path.
     assert "config-get" in ALLOWED_HTTP_COMMANDS
+    # config-write is allowlisted too: a remote apply has to persist the
+    # configuration to the daemon's own file, or a restart reverts it. It takes
+    # no arguments, so request input cannot aim it elsewhere.
+    assert "config-write" in ALLOWED_HTTP_COMMANDS
     with pytest.raises(ControlChannelError, match="not an allowed"):
         send_http_command("http://127.0.0.1:1/", "shutdown")
 

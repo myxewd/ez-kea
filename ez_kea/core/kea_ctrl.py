@@ -45,6 +45,12 @@ ALLOWED_COMMANDS = {"ha-heartbeat", "status-get", "config-reload"}
 # into a way to push a document down a channel that never expected one.
 ALLOWED_HTTP_COMMANDS = {
     "ha-heartbeat", "status-get", "config-get", "config-test", "config-set",
+    # config-write persists the running configuration to the file the daemon
+    # was started with. A config-set alone is memory-only, so without this a
+    # remote daemon's own file would keep an older configuration and a restart
+    # would silently revert what Apply just pushed. It takes no arguments, so
+    # request input cannot point it at another path.
+    "config-write",
     # Pulling a remote endpoint's lease table into its local mirror; both take
     # no arguments, so they cannot be steered by request input.
     "lease4-get-all", "lease6-get-all",

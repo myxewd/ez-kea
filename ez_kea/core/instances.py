@@ -30,6 +30,7 @@ somebody's Kea configuration, and silently deleting that is not this module's
 call to make.
 """
 import csv
+import json
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -81,11 +82,24 @@ def instance_dir(instance) -> str:
 
 
 def mirror_paths(instance) -> Dict[str, str]:
-    """The local mirror file for each DHCP version of an http instance."""
+    """
+    The local files backing one http instance.
+
+    "4"/"6" are the mirrors the pages read and edit. "base4"/"base6" hold the
+    document the last successful pull returned: that is what makes it possible
+    to tell an EZ-KEA edit from a change made on the daemon (see
+    core/config_merge.py), and its presence is also the proof that the mirror
+    is a copy of a real daemon rather than a seeded skeleton. "pull_state"
+    records which endpoint URL each baseline came from and when, so a mirror
+    re-pointed at another daemon is not mistaken for a current one.
+    """
     directory = instance_dir(instance)
     return {
         "4": os.path.join(directory, "kea-dhcp4.conf"),
         "6": os.path.join(directory, "kea-dhcp6.conf"),
+        "base4": os.path.join(directory, "kea-dhcp4.pulled.conf"),
+        "base6": os.path.join(directory, "kea-dhcp6.pulled.conf"),
+        "pull_state": os.path.join(directory, "kea-pull-state.json"),
         # Lease tables pulled with lease4-get-all / lease6-get-all, in the same
         # memfile CSV shape the local daemon writes -- so the existing Leases
         # page (and its search index) reads them without knowing where they
@@ -113,6 +127,124 @@ def ensure_mirrors(instance) -> Dict[str, str]:
     if not os.path.isfile(paths["6"]):
         save_json(dict(_DEFAULT_KEA6_CONFIG), paths["6"])
     return paths
+
+
+def document_from_arguments(arguments: Any, version: str) -> Optional[Dict[str, Any]]:
+    """
+    The document to mirror from one config-get response's arguments.
+
+    Kea answers with the daemon's section plus some metadata (notably the
+    configuration hash, which must not be pushed back to config-test/config-set
+    as if it were a setting), and with the top-level Logging block when one is
+    configured. Only those real document sections are kept.
+    """
+    key = "Dhcp6" if str(version) == "6" else "Dhcp4"
+    if not isinstance(arguments, dict):
+        return None
+    section = arguments.get(key)
+    if not isinstance(section, dict):
+        return None
+    payload: Dict[str, Any] = {key: section}
+    if isinstance(arguments.get("Logging"), dict):
+        payload["Logging"] = arguments["Logging"]
+    return payload
+
+
+def _pull_state_file(instance) -> str:
+    return mirror_paths(instance)["pull_state"]
+
+
+def _read_pull_state(instance) -> Dict[str, Any]:
+    """The per-version records of the last successful pull, or {} if unreadable."""
+    try:
+        with open(_pull_state_file(instance), "r") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def pull_state(instance) -> Dict[str, Any]:
+    """Public read of the pull bookkeeping (which URL each baseline came from)."""
+    return _read_pull_state(instance)
+
+
+def _write_pull_state(instance, version: str, url: str, config_hash: Any) -> None:
+    state = _read_pull_state(instance)
+    state[str(version)] = {
+        "url": url or "",
+        "pulled_at": time.time(),
+        "hash": str(config_hash or ""),
+    }
+    save_json(state, _pull_state_file(instance))
+
+
+def _document_from_file(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def merge_base(instance, version: str) -> Optional[Dict[str, Any]]:
+    """
+    The pulled snapshot Apply must merge against, or None when there is none.
+
+    None means EZ-KEA cannot tell an edit of its own from a change made on the
+    daemon -- because the endpoint was never pulled successfully, the copy
+    predates this bookkeeping, or the endpoint URL has changed since the pull.
+    Apply refuses rather than pushing a document it cannot reason about.
+    """
+    if instance is None or instance.mode != MODE_HTTP:
+        return None
+    url = instance.http_url if str(version) == "4" else instance.http_url6
+    state = _read_pull_state(instance).get(str(version))
+    if not isinstance(state, dict) or state.get("url") != (url or ""):
+        return None
+    path = mirror_paths(instance)["base4" if str(version) == "4" else "base6"]
+    return _document_from_file(path)
+
+
+def _backup_mirror(path: str) -> None:
+    """Best-effort backup of a mirror file before it is replaced."""
+    try:
+        if os.path.isfile(path):
+            copy_file(path, current_app.config["BACKUP_DIR"])
+    except Exception:
+        pass  # a mirror is a copy, not the daemon's own file; never block on this
+
+
+def record_pull(instance, version: str, url: str, document: Dict[str, Any],
+                config_hash: Any = "") -> None:
+    """
+    Remember a successful pull as this endpoint's merge baseline.
+
+    Called only after config-get succeeded, so a mirror that is still the seeded
+    skeleton never gets a baseline and can never be applied.
+    """
+    save_json(document, mirror_paths(instance)["base4" if str(version) == "4" else "base6"])
+    _write_pull_state(instance, version, url, config_hash)
+
+
+def record_applied(instance, version: str, document: Dict[str, Any],
+                   config_hash: Any = "") -> None:
+    """
+    Record that the daemon now runs `document`.
+
+    After a successful Apply there is no unapplied delta left, so the mirror and
+    the merge baseline both become the configuration the daemon reports -- same
+    bytes, so the next Apply diffs against the truth rather than against a
+    memory of it.
+    """
+    paths = mirror_paths(instance)
+    target = paths[str(version)]
+    _backup_mirror(target)
+    save_json(document, target)
+    save_json(document, paths["base4" if str(version) == "4" else "base6"])
+    url = instance.http_url if str(version) == "4" else instance.http_url6
+    _write_pull_state(instance, version, url, config_hash)
 
 
 def overrides_for(instance) -> Optional[Dict[str, Any]]:
@@ -559,6 +691,10 @@ def pull_config(instance) -> List[str]:
     Uses config-get, which returns the configuration the daemon is running
     right now -- not the file on its disk, which may differ if someone applied
     a config-set. Returns a list of warnings (empty means everything pulled).
+
+    A successful pull also stores the document as the endpoint's merge baseline
+    (see merge_base), which is what lets Apply replay only EZ-KEA's own edits
+    onto a daemon that changed underneath the mirror.
     """
     from .kea_ctrl import HTTP_CONFIG_TIMEOUT_SECONDS, ControlChannelError, send_http_command
 
@@ -584,24 +720,24 @@ def pull_config(instance) -> List[str]:
                             % (url, response.get("text") or "no explanation given"))
             continue
 
-        document = response.get("arguments") or {}
-        section = document.get(key) if isinstance(document, dict) else None
-        if not isinstance(section, dict):
+        arguments = response.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        # The daemon's section plus the top-level Logging block (part of what
+        # the running configuration is; dropping it would describe a daemon
+        # with no logging configured), and none of the response metadata.
+        payload = document_from_arguments(arguments, version)
+        if payload is None:
             warnings.append("The configuration returned by %s has no %s section." % (url, key))
             continue
-
-        payload: Dict[str, Any] = {key: section}
-        # Keep the top-level Logging block with the daemon section: it is part
-        # of what the running configuration is, and dropping it would make the
-        # mirror describe a daemon with no logging configured.
-        if isinstance(document.get("Logging"), dict):
-            payload["Logging"] = document["Logging"]
 
         target = paths[version]
         try:
             if os.path.isfile(target):
                 copy_file(target, current_app.config["BACKUP_DIR"])
             save_json(payload, target)
+            record_pull(instance, version, url, payload,
+                        config_hash=arguments.get("hash", ""))
         except Exception as e:  # permission, disk, whatever -- report, don't crash the UI
             warnings.append("Could not write the local mirror %s: %s" % (target, e))
 
