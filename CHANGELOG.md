@@ -23,6 +23,15 @@ reads and always backs it up first.
   `/healthz`, then stops it and requires exit code 0 in under a second, before
   the push. `--no-smoke` skips the check.
 
+- **The release script can be resumed.** A push that fails on the network (the
+  one step with nothing to do with the code) used to leave the release
+  unresumable: re-running it said "the version is already X" and stopped. The
+  same command now picks up where the last one stopped, retries the push three
+  times first, and moves an unpublished tag onto the new HEAD if a follow-up
+  commit landed after it. It also refuses to tag while other tracked files are
+  still modified -- which is how a release ends up pointing at a commit that
+  does not contain the fix that prompted it.
+
 ### Fixed
 
 - **The container stops when it is told to, and says what it is doing.** In the
