@@ -3,6 +3,7 @@
 
 import json
 from typing import Any, Dict, Optional, Union, Tuple
+from urllib.parse import urlencode
 from flask_login import login_required
 from flask import Blueprint, render_template, request, redirect, url_for, current_app, flash
 from werkzeug.wrappers import Response
@@ -13,11 +14,28 @@ from ..core.validation import (
     V4_BOOT_FIELDS, parse_scope_params, apply_scope_params, update_option_data,
     validate_option_data, _parse_option_rows,
 )
-from ..core import ipxe, state_index
+from ..core import instances, ipxe, state_index
 from ..core.instances import config_snapshot, ensure_leases
 from ..core.csv_export import stream_csv_response
 
 dhcp4_bp = Blueprint('dhcp4', __name__)
+
+# The search state the Leases page is rendered with. Every one of these is a
+# query-string parameter of that one page, so a row's Evict form can post them
+# back and land the operator exactly where they were.
+_LEASE_FILTER_FIELDS = ("q", "status", "subnet", "range", "start", "end", "sort", "direction", "page")
+
+
+def _leases_redirect() -> str:
+    """The Leases page, carrying back the filters the row's form posted.
+
+    Read from the submitted form rather than from Referer: a Referer is
+    attacker-controlled and would turn this into an open redirect, while these
+    fields can only ever produce a query string on this one page.
+    """
+    values = {name: (request.form.get(name) or "").strip() for name in _LEASE_FILTER_FIELDS}
+    query = urlencode({name: value for name, value in values.items() if value})
+    return url_for("main.dhcp4.leases") + (("?" + query) if query else "")
 
 
 def _pagination_params() -> Tuple[int, str, str]:
@@ -851,9 +869,17 @@ def leases() -> str:
         row["expiration_time"] = unix_to_human_readable(row["expire"]) if row["expire"] else "-"
         row["status"] = state_index.status_label(row["state"], row["expire"])
 
+    # Evict is a command sent to the daemon that owns the lease database, so it
+    # only exists while such an endpoint is selected. For this installation's
+    # own local daemon the table is read from that daemon's lease file, and
+    # rewriting it behind a running kea-dhcp4 is not something EZ-KEA does.
+    instance = instances.active_instance()
+    evict_available = instance is not None and instance.mode == instances.MODE_HTTP
+
     return render_template(
         "leases.html",
         leases=rows,
+        evict_available=evict_available,
         total=result["total"],
         page=page, page_size=page_size,
         has_next=(page * page_size) < result["total"],
@@ -905,3 +931,42 @@ def leases_export() -> Response:
         ["address", "mac_address", "client_id", "hostname", "subnet", "valid_lifetime", "expire", "state"],
         rows(), to_values, "ez-kea-leases4", state_index.EXPORT_MAX_ROWS,
     )
+
+
+@dhcp4_bp.route("/leases/evict", methods=["POST"])
+@login_required
+def evict_lease() -> Union[Response, Tuple[str, int]]:
+    """Delete one lease on the selected remote endpoint (Kea's lease4-del).
+
+    Remote only, on purpose: for a local daemon the lease table is the CSV that
+    kea-dhcp4 itself owns and rewrites, so editing it behind the running server
+    would be undone on its next write and could corrupt the file. Asking the
+    daemon that owns the database to delete the lease is the only correct way,
+    and that is exactly what the HTTP control channel is for.
+
+    The client keeps the address until its next renewal or DISCOVER; evicting
+    frees the address in Kea's database, it does not reach out and reclaim it
+    on the wire.
+    """
+    instance = instances.active_instance()
+    if instance is None or instance.mode != instances.MODE_HTTP:
+        return ("Evicting a lease is only possible for a remote Kea endpoint: a "
+                "local daemon's leases are the lease file that daemon owns."), 400
+
+    ip_address = (request.form.get("ip-address") or "").strip()
+    if not validate_ipv4_address(ip_address):
+        flash(f"'{ip_address}' is not a valid IPv4 address.", "danger")
+        return redirect(_leases_redirect())
+
+    ok, messages = instances.evict_lease(instance, "4", ip_address)
+    if ok:
+        flash(f"Lease {ip_address} evicted from {instance.name}.", "success")
+        for message in messages:
+            flash(message, "warning")
+        # evict_lease re-pulled the mirror, so reindex now: the row is gone
+        # from the page rather than at the next background ingest pass.
+        state_index.reindex_now(current_app, kinds=["lease4"])
+    else:
+        for message in messages:
+            flash(message, "danger")
+    return redirect(_leases_redirect())

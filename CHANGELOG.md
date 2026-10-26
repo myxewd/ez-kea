@@ -12,6 +12,27 @@ reads and always backs it up first.
 
 ## [Unreleased]
 
+### Added
+
+- **The Leases page can evict a lease, on a remote endpoint.** Each row now has
+  an `Operation` column carrying an `Evict` button, which sends Kea's
+  `lease4-del` down the endpoint's HTTP control channel and then re-pulls the
+  lease mirror, so the row leaves the table immediately instead of at the next
+  background ingest pass. It is offered only while a remote endpoint is
+  selected: for this installation's own daemon the table is read from the lease
+  file that daemon owns and rewrites, and editing that behind a running
+  `kea-dhcp4` is not something EZ-KEA does.
+
+### Fixed
+
+- **A lease pulled from Kea 3.x no longer looks expired the moment it is
+  issued.** Kea 3.x renamed the lifetime field in `lease4-get-all` /
+  `lease6-get-all` to `valid-lft`; EZ-KEA read only 2.x's `valid-lifetime`,
+  so the lifetime came back as zero and a lease's expiration was computed as its
+  own allocation time. Every freshly handed-out lease therefore rendered as
+  "Expired", with an Expiration Time equal to the moment it was issued. Both
+  spellings are read now (and `pref-lft` for DHCPv6).
+
 ## [0.10.2.2] — 2026-10-21
 
 ### Added

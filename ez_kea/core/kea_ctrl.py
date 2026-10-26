@@ -54,6 +54,12 @@ ALLOWED_HTTP_COMMANDS = {
     # Pulling a remote endpoint's lease table into its local mirror; both take
     # no arguments, so they cannot be steered by request input.
     "lease4-get-all", "lease6-get-all",
+    # Deleting one lease on a remote daemon -- the Leases page's Evict action.
+    # Unlike the two above this one *does* take arguments, so the caller is
+    # responsible for what goes in them: instances.evict_lease() passes a single
+    # validated "ip-address" and nothing else, which is the whole surface Kea's
+    # lease4-del exposes for deleting an address lease.
+    "lease4-del",
 }
 
 # Kea's own HTTP/HTTPS control socket (since 2.7.2) reuses the listener defaults

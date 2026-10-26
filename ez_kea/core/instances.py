@@ -33,7 +33,7 @@ import csv
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import current_app, g, has_app_context, session
 
@@ -555,10 +555,29 @@ def _csv_value(value: Any) -> str:
     return str(value)
 
 
+def _lease_field(lease: Dict[str, Any], *names: str) -> Any:
+    """First present value among `names`.
+
+    Kea renames response fields between major versions (3.x reports
+    "valid-lft" where 2.x reported "valid-lifetime"), so every field this
+    module reads goes through here instead of a single hard-coded spelling.
+    """
+    for name in names:
+        value = lease.get(name)
+        if value is not None:
+            return value
+    return None
+
+
 def _lease_row(lease: Dict[str, Any], version: str) -> Dict[str, str]:
     """Convert one lease4-get-all/lease6-get-all entry to memfile columns."""
-    cltt = lease.get("cltt") or 0
-    lifetime = lease.get("valid-lifetime") or lease.get("valid_lifetime") or 0
+    cltt = _lease_field(lease, "cltt") or 0
+    # Kea 3.x answers with "valid-lft"; 2.x answered "valid-lifetime" (the
+    # memfile column is "valid_lifetime"). Reading only the 2.x spelling left
+    # the lifetime at 0, so expire came out equal to cltt -- every pulled lease
+    # then looked like it had already expired the instant the daemon handed it
+    # out, because its "expiration" was its own allocation time.
+    lifetime = _lease_field(lease, "valid-lifetime", "valid_lifetime", "valid-lft") or 0
     try:
         expire = int(cltt) + int(lifetime)
     except (TypeError, ValueError):
@@ -581,7 +600,7 @@ def _lease_row(lease: Dict[str, Any], version: str) -> Dict[str, str]:
         row["client_id"] = _csv_value(lease.get("client-id"))
     else:
         row["duid"] = _csv_value(lease.get("duid"))
-        row["pref_lifetime"] = _csv_value(lease.get("pref-lifetime"))
+        row["pref_lifetime"] = _csv_value(_lease_field(lease, "pref-lifetime", "pref-lft"))
         # Kea calls the v6 lease type "type"; the CSV calls it "lease_type".
         row["lease_type"] = _csv_value(lease.get("type"))
         row["iaid"] = _csv_value(lease.get("iaid"))
@@ -676,6 +695,57 @@ def ensure_leases(version: str, max_age: float = 15.0) -> List[str]:
     if age is not None and age < max_age:
         return []
     return pull_leases(instance, version)
+
+
+def evict_lease(instance, version: str, ip_address: str) -> Tuple[bool, List[str]]:
+    """
+    Delete one lease from a remote daemon's own lease database.
+
+    Returns (ok, messages). ok is False only when the daemon refused the
+    delete or could not be reached; "that lease is not there any more" comes
+    back as (True, [...]) because the row leaving the table is what the
+    operator asked for -- between the page being rendered and the click
+    arriving, the client may have renewed elsewhere, released, or expired.
+
+    The local mirror is re-pulled on success so the row disappears from the
+    page immediately instead of at the next background ingest pass.
+    """
+    from .kea_ctrl import HTTP_CONFIG_TIMEOUT_SECONDS, ControlChannelError, send_http_command
+
+    if instance is None or instance.mode != MODE_HTTP:
+        return False, ["Evicting a lease needs a remote Kea endpoint: a local "
+                       "daemon's leases live in the lease file the daemon owns."]
+
+    url = instance.http_url if version == "4" else instance.http_url6
+    if not url:
+        return False, ["This endpoint has no DHCPv%s control channel, so there is "
+                       "no lease database to evict from." % version]
+
+    command = "lease4-del" if version == "4" else "lease6-del"
+    auth = (instance.http_user, instance.http_password) if instance.http_user and instance.http_password else None
+
+    try:
+        response = send_http_command(
+            url, command, arguments={"ip-address": ip_address},
+            timeout=HTTP_CONFIG_TIMEOUT_SECONDS, auth=auth,
+        )
+    except ControlChannelError as e:
+        return False, ["Could not evict %s on %s: %s" % (ip_address, url, e)]
+
+    result = response.get("result")
+    if result == 3:
+        # Kea's "no such lease". The table is still re-pulled: the row this
+        # operator is looking at is stale, and leaving it there would invite
+        # the same click again.
+        warnings = pull_leases(instance, version)
+        return True, ["%s was already gone from %s's lease table (%s)."
+                      % (ip_address, url, str(response.get("text") or "no such lease"))] + \
+                     (warnings or ["The table below has been refreshed."])
+    if result != 0:
+        return False, ["Kea at %s refused %s for %s: %s"
+                       % (url, command, ip_address, str(response.get("text") or "no explanation given"))]
+
+    return True, pull_leases(instance, version)
 
 
 def describe(instance) -> str:

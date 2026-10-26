@@ -101,6 +101,9 @@ q={{ search_query | urlencode }}&status={{ status | urlencode }}&subnet={{ subne
                         <th>{{ sort_link('subnet', 'Subnet') }}</th>
                         <th>{{ sort_link('expire', 'Expiration Time') }}</th>
                         <th>Status</th>
+                        {% if evict_available %}
+                        <th style="text-align: right;">Operation</th>
+                        {% endif %}
                     </tr>
                 </thead>
                 <tbody>
@@ -136,6 +139,27 @@ q={{ search_query | urlencode }}&status={{ status | urlencode }}&subnet={{ subne
                             <span class="badge" style="background-color: rgba(255, 255, 255, 0.1);">Expired</span>
                             {% endif %}
                         </td>
+                        {% if evict_available %}
+                        <td style="text-align: right;">
+                            <form action="{{ url_for('main.dhcp4.evict_lease') }}" method="POST" style="margin: 0; display: inline;"
+                                onsubmit="return confirm('Evict the lease for {{ lease.address }}? Kea forgets this lease immediately; the client keeps using the address until its next renewal or DISCOVER, when it will be given another one.');">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="hidden" name="ip-address" value="{{ lease.address }}">
+                                <input type="hidden" name="q" value="{{ search_query }}">
+                                <input type="hidden" name="status" value="{{ status }}">
+                                <input type="hidden" name="subnet" value="{{ subnet }}">
+                                <input type="hidden" name="range" value="{{ selected_range }}">
+                                <input type="hidden" name="start" value="{{ start_text }}">
+                                <input type="hidden" name="end" value="{{ end_text }}">
+                                <input type="hidden" name="sort" value="{{ sort_col }}">
+                                <input type="hidden" name="direction" value="{{ dir_col }}">
+                                <input type="hidden" name="page" value="{{ page }}">
+                                <button type="submit" class="btn btn-danger btn-sm" title="Evict lease {{ lease.address }}">
+                                    <i data-lucide="trash"></i> Evict
+                                </button>
+                            </form>
+                        </td>
+                        {% endif %}
                     </tr>
                     {% endfor %}
                 </tbody>
