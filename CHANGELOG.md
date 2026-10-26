@@ -12,6 +12,8 @@ reads and always backs it up first.
 
 ## [Unreleased]
 
+## [0.10.2.3] — 2026-10-26
+
 ### Added
 
 - **The Leases page can evict a lease, on a remote endpoint.** Each row now has
@@ -509,7 +511,8 @@ version on it so an install can be identified.
   note and nothing more.
 - Branding standardized on EZ-KEA.
 
-[Unreleased]: https://github.com/fenleytech/ez-kea/compare/v0.10.2.2...HEAD
+[Unreleased]: https://github.com/fenleytech/ez-kea/compare/v0.10.2.3...HEAD
+[0.10.2.3]: https://github.com/fenleytech/ez-kea/compare/v0.10.2.2...v0.10.2.3
 [0.10.2.2]: https://github.com/fenleytech/ez-kea/compare/v0.10.2.1...v0.10.2.2
 [0.10.2.1]: https://github.com/fenleytech/ez-kea/compare/v0.10.2...v0.10.2.1
 [0.10.2]: https://github.com/fenleytech/ez-kea/compare/v0.9.2...v0.10.2

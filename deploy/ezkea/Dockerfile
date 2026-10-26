@@ -3,9 +3,9 @@
 # Build context is this directory, NOT the repository root, so the project is
 # fetched from git at image-build time instead of copied from a working tree:
 #
-#   docker build -t ez-kea:0.10.2.2 \
+#   docker build -t ez-kea:0.10.2.3 \
 #     --build-arg EZK_SRC=https://github.com/myxewd/ez-kea.git \
-#     --build-arg EZK_REF=v0.10.2.2 deploy/ezkea
+#     --build-arg EZK_REF=v0.10.2.3 deploy/ezkea
 #
 # For a fork, point the two arguments at the fork and the ref you want. EZK_REF
 # may be a branch, a tag or a commit SHA, but it has to exist on EZK_SRC -- push

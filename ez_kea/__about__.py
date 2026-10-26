@@ -13,4 +13,4 @@ Bump this in the same commit that tags the release, so a checkout at the tag
 and the tag itself never disagree.
 """
 
-__version__ = "0.10.2.2"
+__version__ = "0.10.2.3"

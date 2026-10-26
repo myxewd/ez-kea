@@ -82,8 +82,8 @@ tree, so "which version is deployed" has exactly one answer.
 git clone https://github.com/myxewd/ez-kea.git /srv/ez-kea-src
 cd /srv/ez-kea-src/deploy
 
-docker build -t ez-kea:0.10.2.2 \
-  --build-arg EZK_REF=v0.10.2.2 \
+docker build -t ez-kea:0.10.2.3 \
+  --build-arg EZK_REF=v0.10.2.3 \
   ./ezkea
 ```
 
@@ -96,10 +96,10 @@ docker build -t ez-kea:0.10.2.2 \
 What was built:
 
 ```bash
-docker run --rm --entrypoint cat ez-kea:0.10.2.2 /opt/ez-kea/.build-git-sha
+docker run --rm --entrypoint cat ez-kea:0.10.2.3 /opt/ez-kea/.build-git-sha
 ```
 
-For an air-gapped host, run `docker save ez-kea:0.10.2.2 | gzip > ez-kea-0.10.2.2.tgz`
+For an air-gapped host, run `docker save ez-kea:0.10.2.3 | gzip > ez-kea-0.10.2.3.tgz`
 where GitHub is reachable, then `docker load` there.
 
 ---
@@ -504,7 +504,7 @@ server {
 
 | Task | How |
 |---|---|
-| Update | `docker build --build-arg EZK_REF=v0.10.2.2 -t ez-kea:0.10.2.2 ./ezkea`, change the tag in `docker-compose.yml`, `docker compose --env-file kea.env up -d`. `/data` is untouched. |
+| Update | `docker build --build-arg EZK_REF=v0.10.2.3 -t ez-kea:0.10.2.3 ./ezkea`, change the tag in `docker-compose.yml`, `docker compose --env-file kea.env up -d`. `/data` is untouched. |
 | Roll back a config | Global Settings → Backup/Restore, or copy the newest file out of `/opt/ez-kea/data/backups`. |
 | Back up EZ-KEA | `tar czf ez-kea-$(date +%F).tgz /opt/ez-kea/data`. The two `*-index.db` files are disposable; `ez-kea.db` and `ez-kea-settings.json` are not. |
 | Read the daemon log | `/opt/ez-kea/kea/log/kea/kea-dhcp4.log`, or Log Search in the UI. |

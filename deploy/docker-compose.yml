@@ -32,7 +32,7 @@ services:
   ezkea:
     # The published image. To build it yourself instead, see ../ezkea/Dockerfile
     # and swap this for the tag you built.
-    image: dreamlord2/ezkea:0.10.2.2
+    image: dreamlord2/ezkea:0.10.2.3
     container_name: ez-kea
     restart: unless-stopped
     ports:
